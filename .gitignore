@@ -1,0 +1,37 @@
+# Build directories & binaries
+build-win/
+dist/
+out/
+scratch/
+__pycache__/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+
+# Game files & dumps
+elf/
+*.ELF
+*.elf
+*.BIN
+*.bin
+*.SELF
+*.self
+*.sprx
+*.prx
+*.iso
+*.pkg
+dev_hdd0/
+dumps/
+*.bmp
+*.jpg
+*.png
+*.mp4
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
