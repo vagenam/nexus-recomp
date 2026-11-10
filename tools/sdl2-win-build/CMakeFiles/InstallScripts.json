@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/coding/nexus-recomp/tools/sdl2-win-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

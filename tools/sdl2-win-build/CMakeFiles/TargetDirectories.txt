@@ -1,0 +1,9 @@
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/sdl_headers_copy.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/SDL2main.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/SDL2-static.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/uninstall.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/edit_cache.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/rebuild_cache.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/list_install_components.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/install.dir
+C:/coding/nexus-recomp/tools/sdl2-win-build/CMakeFiles/install/local.dir
