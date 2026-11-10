@@ -51,7 +51,7 @@ Press **F1** (or **Esc**) during gameplay or menus to open the settings overlay.
 - **Performance:**
   - **CPU Profile:**
     - `General (Default)` (`RACACIT_CPU_MODE=0`): SPU lanes yield after a short 30 µs spin. Recommended for most modern 4-, 6-, and 8-core consumer CPUs (AMD Ryzen, Intel Core) so worker threads don't starve other processes or threads.
-    - `Xeon / Multi-core` (`RACACIT_CPU_MODE=1`): SPU lanes spin longer (200 µs), reducing thread sleep and wake latency overhead on high-core-count, lower-clock workstation/server CPUs (e.g., Intel Xeon E5).
+    - `Xeon e5 2680v4` (`RACACIT_CPU_MODE=1`): SPU lanes spin longer (200 µs), reducing thread sleep and wake latency overhead on high-core-count, lower-clock workstation/server CPUs (e.g., Intel Xeon E5).
 - **Controls:** Configure DualSense / gamepad features and keyboard/mouse settings.
 
 ## Legal Notice
