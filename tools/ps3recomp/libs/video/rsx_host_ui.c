@@ -130,7 +130,7 @@ void rsx_host_ui_load_options(void)
     fprintf(stderr, "[settings] DualSense Plus: %s%c", o.ds_plus ? "on (DualSense extras, Fire on R2)"
                                                     : "off (every controller a plain pad, PS3 layout)", 10);
     o.tex_quality   = 0;
-    o.cpu_mode      = 0;
+    o.cpu_mode      = env_int("RACACIT_CPU_MODE", 0);
     o.present_pace  = 0;
     o.kbm           = env_int("RACACIT_KBM", 1) ? 1 : 0;
     { const char* v = getenv("RACACIT_MOUSE_SENS"); const double m = v && *v ? atof(v) : 1.0;
@@ -139,7 +139,7 @@ void rsx_host_ui_load_options(void)
     o.fov           = 100;
     o.cam_dist      = 100;
     s_texq_active   = 0;
-    g_racacit_spu_spin_us = 30;
+    g_racacit_spu_spin_us = o.cpu_mode ? 200 : 30;
     g_racacit_present_pace = 0;
     o.gen = 1;
     if (o.display_mode != RSX_UI_DISPLAY_WINDOWED) s_last_full = o.display_mode;
@@ -194,6 +194,7 @@ static void settings_lines(const rsx_host_options* o, char kv[][96], int* n)
                                                    : o->vsync == RSX_UI_VSYNC_IMMEDIATE ? "immediate" : "mailbox");
     snprintf(kv[k++], 96, "RACACIT_ASPECT=%s", o->keep_aspect ? "keep" : "stretch");
     snprintf(kv[k++], 96, "RACACIT_FPS=%d", o->fps);
+    snprintf(kv[k++], 96, "RACACIT_CPU_MODE=%d", o->cpu_mode);
     snprintf(kv[k++], 96, "RACACIT_DS_SPEAKER=%d", o->ds_speaker);
     snprintf(kv[k++], 96, "RACACIT_DS_SPK_VOL=%d", o->ds_volume);
     snprintf(kv[k++], 96, "RACACIT_DS_HAPTICS=%d", o->ds_haptics);
@@ -375,6 +376,8 @@ static const ui_row k_rows_general[] = {
     { K_OPT, R_VSYNC,   "VSync" },
     { K_OPT, R_ASPECT,  "Aspect ratio" },
     { K_OPT, R_FPS,     "FPS counter" },
+    { K_HEAD, 0, "Performance" },
+    { K_OPT, R_CPU,     "CPU profile" },
     { K_GAP, 0, "" },
     { K_ACT, R_RESUME,  "Resume" },
     { K_ACT, R_QUIT,    "Quit game" },
@@ -478,6 +481,7 @@ static void value_text(int id, const rsx_host_options* o, char* b, size_t n)
                                        : o->vsync == RSX_UI_VSYNC_IMMEDIATE ? "Off (allow tearing)" : "Off (no tearing)"); break;
     case R_ASPECT:  snprintf(b, n, "%s", o->keep_aspect ? "16:9" : "Stretch to window"); break;
     case R_FPS:     snprintf(b, n, "%s", o->fps ? "On" : "Off"); break;
+    case R_CPU:     snprintf(b, n, "%s", o->cpu_mode == 1 ? "Xeon / Multi-core" : "General (Default)"); break;
     case R_UPSCALE: snprintf(b, n, "%s", o->upscale == RSX_UI_UPSCALE_SHARP ? "Sharp (bicubic + sharpen)"
                                        : o->upscale == RSX_UI_UPSCALE_NEAREST ? "Nearest (pixelated)" : "Bilinear"); break;
     case R_SHARP:   snprintf(b, n, "%d%%", o->sharpness * 10); break;
@@ -527,6 +531,10 @@ static void adjust(int id, int dir)
     case R_VSYNC:   o->vsync = cycle(o->vsync, 3, dir); o->swap_gen++; break;
     case R_ASPECT:  o->keep_aspect = !o->keep_aspect; break;
     case R_FPS:     o->fps = !o->fps; break;
+    case R_CPU:
+        o->cpu_mode = !o->cpu_mode;
+        g_racacit_spu_spin_us = o->cpu_mode ? 200 : 30;
+        break;
     case R_UPSCALE: o->upscale = cycle(o->upscale, 3, dir); break;
     case R_SHARP:   o->sharpness = clampi(o->sharpness + dir, 0, 10); break;
     case R_DSSPK:   o->ds_speaker = !o->ds_speaker; break;
