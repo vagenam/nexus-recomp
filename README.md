@@ -7,7 +7,7 @@ A native PC x86-64 static recompilation of **Ratchet & Clank: Into the Nexus** (
 - **Audio:** 
   - FMV / cutscene movies have full audio.
   - **Menu and gameplay currently have no audio** (in-game audio mixer pipeline is under active development).
-- **Controls:** DualSense and standard XInput gamepads supported (Note: Title screen currently requires pressing START twice to proceed).
+- **Controls:** Gamepads supported via SDL2 (PlayStation DualSense / DualShock 4 with native HIDAPI, Xbox / XInput controllers).
 - **Gameplay:** Early WIP / unstable. Boots into playable gameplay, but rendering and effects are currently broken, frame rate is unstable, and crashes can occur during early gameplay.
 
 ## Requirements
