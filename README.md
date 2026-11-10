@@ -38,8 +38,19 @@ The compiled binary `NexusRecomp.exe` will be generated in `build-win/game/`.
    GAME=C:\path\to\Ratchet & Clank - Into the Nexus (USA)\PS3_GAME
    RACACIT_WINDOW_SIZE=1920x1080
    RACACIT_DISPLAY_MODE=windowed
+   RACACIT_CPU_MODE=0
    ```
 3. Launch `NexusRecomp.exe`.
+
+## In-Game Settings Menu (F1 / Esc)
+Press **F1** (or **Esc**) during gameplay or menus to open the settings overlay.
+
+- **Display:** Toggle Fullscreen/Borderless/Windowed, Window Size, VSync, Aspect Ratio, and FPS counter.
+- **Performance:**
+  - **CPU Profile:**
+    - `General (Default)` (`RACACIT_CPU_MODE=0`): SPU lanes yield after a short 30 µs spin. Recommended for most modern 4-, 6-, and 8-core consumer CPUs (AMD Ryzen, Intel Core) so worker threads don't starve other processes or threads.
+    - `Xeon / Multi-core` (`RACACIT_CPU_MODE=1`): SPU lanes spin longer (200 µs), reducing thread sleep and wake latency overhead on high-core-count, lower-clock workstation/server CPUs (e.g., Intel Xeon E5).
+- **Controls:** Configure DualSense / gamepad features and keyboard/mouse settings.
 
 ## Legal Notice
 This project is an independent clean-room static recompiler runtime and does not distribute copyrighted game assets, PS3 disc contents, or Sony PlayStation proprietary SDK files. To play the game, you must supply your own legally dumped files from *Ratchet & Clank: Into the Nexus* (`BCUS99245`).
