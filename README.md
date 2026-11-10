@@ -2,7 +2,7 @@
 
 A native PC x86-64 static recompilation of **Ratchet & Clank: Into the Nexus** (PS3 USA Disc version, `BCUS99245` v1.00) powered by the `ps3recomp` runtime.
 
-> **Note:** This project is created and maintained entirely with Artificial Intelligence (AI).
+> **Note:** This project is created entirely with Artificial Intelligence (AI).
 
 ## Project Status: Work-in-Progress (WIP)
 - **Boot & Intro:** Working (Safety screens, intro cinematics, and title screen boot).
