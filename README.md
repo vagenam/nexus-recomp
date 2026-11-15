@@ -43,13 +43,6 @@ We do **not** ship a precompiled `NexusRecomp.exe` or any copyrighted game code/
 
 ---
 
-## In-Game Settings Menu (`F1` / `Esc`)
-Press **F1** (or **Esc**) during gameplay or menus to open the settings overlay:
-- **Display:** Fullscreen / Borderless / Windowed, Window Size, VSync, Aspect Ratio, FPS Counter, Internal Resolution (`0.50x` up to `3.00x` 4K).
-- **Controls:** DualSense haptics/triggers/speaker/lightbar, R1/R2 swap, and Keyboard & Mouse sensitivity.
-
----
-
 ## `v0.3` Changelog
 - **Dynamic Bolt Spawn Cap (`func_004E9F98`):** Caps physical bolt spawns at 3 per burst while scaling each bolt's value so economy/progression remains 100% exact.
 - **Crate Debris Moby Burst Cap (`func_00784E20`):** Caps runaway crate-plank Moby bursts (`cls=0x55`) during active gameplay (after the first 2s of level load), eliminating the `igAnim` (`0x00588B80`) SPU stall and 8.5 FPS hang.
@@ -64,7 +57,7 @@ Press **F1** (or **Esc**) during gameplay or menus to open the settings overlay:
 - Achieve stable **60 FPS** across full gameplay
 - Optional graphics enhancements (e.g., **SMAA**, improved shadows, and possibly **FSR**)
 - Nicer, more polished installer experience
-
+- Test the whole game, make sure its playable from start to the end
 ---
 
 ## Reporting Bugs
