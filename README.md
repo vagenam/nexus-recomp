@@ -81,12 +81,12 @@ I do this bc i love ps3 era games, hate that they are stuck on ps3 and bc ratche
 ---
 
 ## Credits
-- **`ps3recomp`** — Core PS3 PPU/SPU/RSX static recompilation runtime and tooling
-- **`RACiT`** — *Ratchet & Clank: A Crack in Time* recompilation research & runtime foundations
-- **`ratchet-tod-recomp`** — *Ratchet & Clank: Tools of Destruction* recompilation insights
-- **`infamous2-recomp`** — *inFAMOUS 2* recompilation & SPURS/RSX research
-- **`resistance-recomp`** — *Resistance* recompilation & Insomniac/PS3 runtime patterns
-- **`Soulbrandt`** — Community research and tooling contributions
+- **[`ps3recomp`](https://github.com/sp00nznet/ps3recomp)** — Core PS3 PPU/SPU/RSX static recompilation runtime and tooling
+- **[`RACiT`](https://github.com/HighDrexler/RACiT)** — *Ratchet & Clank: A Crack in Time* recompilation research & runtime foundations
+- **[`ratchet-tod-recomp`](https://github.com/Re-TeRo17/ratchet-tod-recomp)** — *Ratchet & Clank: Tools of Destruction* recompilation insights
+- **[`infamous2-recomp`](https://github.com/bhuiyah/infamous2-recomp)** — *inFAMOUS 2* recompilation & SPURS/RSX research
+- **[`resistance-recomp`](https://github.com/erikomis/resistance-recomp)** — *Resistance* recompilation & Insomniac/PS3 runtime patterns
+- **[`Soulbrandt`](https://github.com/JonathanDC64/Soulbrandt)** — Community research and tooling contributions
 
 ---
 
