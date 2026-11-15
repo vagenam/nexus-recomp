@@ -90,5 +90,9 @@ I do this bc i love ps3 era games, hate that they are stuck on ps3 and bc ratche
 
 ---
 
-## Legal Notice
-This project is an independent clean-room static recompiler runtime and does not distribute copyrighted game assets, PS3 disc contents, or Sony PlayStation proprietary SDK files. To play the game, you must supply your own legally dumped files from *Ratchet & Clank: Into the Nexus* (`BCUS99245`).
+## Legal
+- This project is **not affiliated with, endorsed, or sponsored by Sony Interactive Entertainment or Insomniac Games.**
+- *Ratchet & Clank*, *Ratchet & Clank: Into the Nexus*, *PlayStation*, *PS3*, *DualShock*, and *DualSense* are trademarks of Sony Interactive Entertainment; all other trademarks belong to their respective owners and are used solely to describe compatibility.
+- **No game code, assets, Sony firmware, or decryption keys are included**, nor anything derived from them. This repository and its releases contain only original runtime/host code, build scripts, and documentation.
+- **You must own the game** (`BCUS99245`) and dump/decrypt it yourself for your own personal use. `RecompBuilder.exe` translates your own copy locally on your PC. **Do not share** the built executable (`RecompFolder\NexusRecomp.exe`), lifted sources (`game\src\recomp\`, `game\spu\`), `elf\EBOOT.ELF`, or your `PS3_GAME` dump, as they contain the game's code or data.
+- See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for third-party open-source licenses.
