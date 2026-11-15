@@ -25,15 +25,29 @@ import time
 import urllib.request
 import zipfile
 
-ROOT = r"c:\coding\nexus-recomp"
-REPOS = r"c:\coding\repos"
-VENV_SCRIPTS = r"c:\coding\.venv\Scripts"
-PYTHON_EXE = os.path.join(VENV_SCRIPTS, "python.exe")
-CMAKE_EXE = os.path.join(VENV_SCRIPTS, "cmake.exe")
-NINJA_EXE = os.path.join(VENV_SCRIPTS, "ninja.exe")
-ZIG_EXE = r"c:\coding\.venv\Lib\site-packages\ziglang\zig.exe"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+REPOS = os.environ.get("NEXUS_REPOS", os.path.join(os.path.dirname(ROOT), "repos"))
+PORTABLE_DIR = os.path.join(ROOT, "tools", ".portable")
+VENV_SCRIPTS = os.path.dirname(sys.executable)
+PYTHON_EXE = sys.executable
+CMAKE_EXE = shutil.which("cmake") or os.path.join(PORTABLE_DIR, "Lib", "site-packages", "cmake", "data", "bin", "cmake.exe")
+NINJA_EXE = shutil.which("ninja") or os.path.join(PORTABLE_DIR, "Scripts", "ninja.exe")
+ZIG_EXE = shutil.which("zig") or os.path.join(PORTABLE_DIR, "Lib", "site-packages", "ziglang", "zig.exe")
 
-GAME_ROOT = r"C:\coding\Put_PS3_Game_Here\Ratchet & Clank - Into the Nexus (USA) (En,Fr,Es)"
+def _find_game_root():
+    env_g = os.environ.get("NEXUS_PS3_GAME", "").strip()
+    if env_g:
+        return os.path.dirname(env_g) if os.path.basename(env_g).upper() == "PS3_GAME" else env_g
+    settings_p = os.path.join(ROOT, "dist", "settings.txt")
+    if os.path.exists(settings_p):
+        with open(settings_p, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("GAME="):
+                    g = line[5:].strip()
+                    return os.path.dirname(g) if os.path.basename(g).upper() == "PS3_GAME" else g
+    return ROOT
+
+GAME_ROOT = _find_game_root()
 ELF_PATH = os.path.join(ROOT, "elf", "EBOOT.ELF")
 OUT_DIR = os.path.join(ROOT, "out")
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -381,11 +395,18 @@ extern "C" void racacit_longjmp(uint32_t guest_buf);
         # 2. Hoisted GCM get fix disabled: regex matched C++ hash tables (Scaleform, etc.) and broke them
         # (GCM FIFO get/put spin loops are handled in HLE cellGcmSys.c instead)
 
-        # 3. Extend 2.5s GPU watchdog timeout (0x0BE420E0 -> 0x5F2EDC00)
-        if "(uint32_t)0xBE4 << 16" in src and "| 0x20E0" in src:
-            src = src.replace("(uint32_t)0xBE4 << 16", "(uint32_t)0x5F2E << 16").replace(
+        # 3. Extend 2.5s GPU watchdog timeout ONLY inside func_005F6DC8 (0x0BE420E0 -> 0x5F2EDC00)
+        # Do NOT replace file-wide -- 0xBE420E0 also appears as a math constant (e.g. func_0063B65C).
+        wd_m = re.search(
+            r"(void func_005F6DC8\(ppu_context\* ctx\) \{.*?\n\})",
+            src,
+            re.DOTALL,
+        )
+        if wd_m and "(uint32_t)0xBE4 << 16" in wd_m.group(1) and "| 0x20E0" in wd_m.group(1):
+            fixed_wd = wd_m.group(1).replace("(uint32_t)0xBE4 << 16", "(uint32_t)0x5F2E << 16").replace(
                 "| 0x20E0", "| 0xDC00"
             )
+            src = src[: wd_m.start(1)] + fixed_wd + src[wd_m.end(1) :]
             watchdog_fixes += 1
             changed = True
 
@@ -407,7 +428,22 @@ extern "C" void racacit_longjmp(uint32_t guest_buf);
 
 def stage2_lift_ppu():
     log("=== STAGE 2: Lifting PPU Code (14,728 functions) ===")
+    os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RECOMP_DIR, exist_ok=True)
+    func_json = os.path.join(OUT_DIR, "EBOOT.functions.json")
+    imp_json = os.path.join(OUT_DIR, "EBOOT.imports.json")
+    if not os.path.exists(func_json) or not os.path.exists(imp_json):
+        log("Running ppu_loader.py to extract functions & imports ...")
+        subprocess.run(
+            [
+                PYTHON_EXE,
+                "-I",
+                os.path.join(PS3R_TOOLS, "ppu_loader.py"),
+                ELF_PATH,
+                "--output", OUT_DIR,
+            ],
+            check=True,
+        )
     header_path = os.path.join(RECOMP_DIR, "ppu_recomp.h")
     if not os.path.exists(header_path):
         env = os.environ.copy()
@@ -554,6 +590,18 @@ def stage3_lift_spu():
     # 3A. Lift the 3 embedded SPU ELFs via build_spu_workloads.py
     workloads_c = os.path.join(SPU_DIR, "spu_workloads.c")
     spu_images_dir = os.path.join(OUT_DIR, "spu_images")
+    if not os.path.exists(spu_images_dir) or not any(f.endswith(".elf") for f in os.listdir(spu_images_dir)):
+        log("Extracting embedded SPU ELF images via extract_spu_images.py ...")
+        subprocess.run(
+            [
+                PYTHON_EXE,
+                "-I",
+                os.path.join(PS3R_TOOLS, "extract_spu_images.py"),
+                ELF_PATH,
+                "--output", spu_images_dir,
+            ],
+            check=True,
+        )
     if not os.path.exists(workloads_c):
         log("Lifting embedded SPU ELF images via build_spu_workloads.py ...")
         subprocess.run(
@@ -759,14 +807,8 @@ def stage3_lift_spu():
         "}\n",
     )
 
-    # 3D. Load GUID-keyed entry hints from RACiT/scripts/spu_starts.txt
+    # 3D. GUID-keyed entry hints (Nexus uses its own EBOOT.elf SPU tables)
     guid_starts = {}
-    racit_starts_path = os.path.join(REPOS, "RACiT", "scripts", "spu_starts.txt")
-    if os.path.exists(racit_starts_path):
-        for line in open(racit_starts_path, "r", encoding="latin-1"):
-            parts = line.split("#")[0].split()
-            if len(parts) >= 2:
-                guid_starts.setdefault(parts[0].lower(), set()).add(int(parts[1], 16))
 
     # Find all GUID-headed blocks across all PT_LOAD segments
     # In PH[0], raw jobs live between 0x00C15000 (after igpm_rt) and 0x00D19B00 (first SPU ELF)
@@ -902,81 +944,15 @@ def stage4_write_sources_and_build():
     os.makedirs(GAME_DIR, exist_ok=True)
     os.makedirs(WIN_DIR, exist_ok=True)
 
-    # Copy and adapt main.cpp, stubs.cpp, button_prompts.cpp, discord_rpc.cpp from RACiT/game
-    racit_game = os.path.join(REPOS, "RACiT", "game")
+    # Verify Nexus game harness sources are present (no external RACiT copy)
     for fname in ("main.cpp", "stubs.cpp", "button_prompts.cpp", "discord_rpc.cpp"):
-        src = open(os.path.join(racit_game, fname), "r", encoding="latin-1").read()
-        src = src.replace("Ratchet & Clank: A Crack in Time", "Ratchet & Clank: Into the Nexus")
-        src = src.replace("RaCACiT.exe", "NexusRecomp.exe")
-        if fname == "stubs.cpp":
-            # In stubs.cpp, func_00937A90, func_0095D30C, func_005004BC are ACiT-specific functions
-            # only called by optional ACiT armor-skin/lua-file hooks; provide weak stubs so link succeeds on Nexus
-            weak_stubs = """
-__attribute__((weak)) void func_00937A90(ppu_context*) {}
-__attribute__((weak)) void func_0095D30C(ppu_context*) {}
-__attribute__((weak)) void func_005004BC(ppu_context*) {}
-"""
-            src = src + "\n" + weak_stubs
-        if fname == "main.cpp":
-            # Default 4K resolution scale (3x 720p = 3840x2160) & high-res shadows for AMD Radeon RX 9060 XT 16GB
-            old_defaults = 'if (!getenv("PS3_TITLE")) _putenv_s("PS3_TITLE", "Ratchet & Clank: Into the Nexus");'
-            new_defaults = (
-                old_defaults
-                + '\n    if (!getenv("RSX_RES_SCALE")) _putenv_s("RSX_RES_SCALE", "3");'
-                + '\n    if (!getenv("RSX_SHADOW_SCALE")) _putenv_s("RSX_SHADOW_SCALE", "200");'
-            )
-            src = src.replace(old_defaults, new_defaults, 1)
-        write_if_changed(os.path.join(GAME_DIR, fname), src)
+        dst_game_file = os.path.join(GAME_DIR, fname)
+        if not os.path.exists(dst_game_file):
+            raise FileNotFoundError(f"Missing Nexus game source: {dst_game_file}")
 
-    # Write game/CMakeLists.txt tuned for Intel Xeon E5-2680 v4 (Broadwell AVX2/FMA3/BMI2)
-    game_cmake = open(os.path.join(racit_game, "CMakeLists.txt"), "r", encoding="latin-1").read()
-    game_cmake = game_cmake.replace(
-        'set(RACACIT_SIMD_FLAGS "-mavx2;-mfma;-mbmi2")',
-        'set(RACACIT_SIMD_FLAGS "-march=broadwell;-mtune=broadwell;-mavx2;-mfma;-mbmi;-mbmi2")',
-    )
-    game_cmake = game_cmake.replace(
-        "OUTPUT_NAME RaCACiT",
-        "OUTPUT_NAME NexusRecomp",
-    )
-    write_if_changed(os.path.join(GAME_DIR, "CMakeLists.txt"), game_cmake)
-
-    # Write windows/CMakeLists.txt
-    win_cmake = """cmake_minimum_required(VERSION 3.22)
-project(nexus_windows C CXX)
-
-get_filename_component(NEXUS_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-
-if(NOT MSVC)
-    add_compile_options(-fomit-frame-pointer -fno-math-errno -march=broadwell -mtune=broadwell)
-endif()
-
-list(APPEND CMAKE_PREFIX_PATH "${NEXUS_ROOT}/tools/sdl2-win")
-find_package(SDL2 REQUIRED CONFIG)
-
-set(ENABLE_OPT              OFF CACHE BOOL "" FORCE)
-set(ENABLE_HLSL             ON  CACHE BOOL "" FORCE)
-set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
-set(GLSLANG_TESTS           OFF CACHE BOOL "" FORCE)
-set(GLSLANG_ENABLE_INSTALL  OFF CACHE BOOL "" FORCE)
-set(BUILD_EXTERNAL          OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS       OFF CACHE BOOL "" FORCE)
-add_subdirectory("${NEXUS_ROOT}/tools/glslang-src" "${CMAKE_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
-foreach(t glslang SPIRV glslang-default-resource-limits)
-    if(TARGET ${t} AND NOT TARGET glslang::${t})
-        add_library(glslang::${t} ALIAS ${t})
-    endif()
-endforeach()
-
-set(PS3RECOMP_RSX_VULKAN   ON  CACHE BOOL "" FORCE)
-set(PS3RECOMP_WIN_USE_SDL2 ON  CACHE BOOL "" FORCE)
-set(PS3RECOMP_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
-set(PS3RECOMP_DIR "${NEXUS_ROOT}/tools/ps3recomp" CACHE PATH "" FORCE)
-set(RECOMP_DIR "${NEXUS_ROOT}/game/src/recomp" CACHE PATH "" FORCE)
-set(SPU_DIR    "${NEXUS_ROOT}/game/spu"        CACHE PATH "" FORCE)
-set(PS3RECOMP_VULKAN_INCLUDE_DIR "${NEXUS_ROOT}/tools/Vulkan-Headers/include" CACHE PATH "" FORCE)
-add_subdirectory("${NEXUS_ROOT}/game" "${CMAKE_BINARY_DIR}/game")
-"""
-    write_if_changed(os.path.join(WIN_DIR, "CMakeLists.txt"), win_cmake)
+    # Use existing game/CMakeLists.txt and windows/CMakeLists.txt from the repo
+    if not os.path.exists(os.path.join(GAME_DIR, "CMakeLists.txt")) or not os.path.exists(os.path.join(WIN_DIR, "CMakeLists.txt")):
+        raise FileNotFoundError("Missing game/CMakeLists.txt or windows/CMakeLists.txt")
 
     env = os.environ.copy()
     env["PATH"] = VENV_SCRIPTS + os.pathsep + env.get("PATH", "")
@@ -1032,31 +1008,23 @@ def stage5_stage_and_verify():
         log(f"Copying decrypted EBOOT.elf to {usrdir_eboot} ...")
         shutil.copy2(ELF_PATH, usrdir_eboot)
 
-    # Also create a clean distribution folder at c:\coding\nexus-recomp\dist\
-    dist_dir = os.path.join(ROOT, "dist")
+    # Stage executable into RecompFolder/
+    dist_dir = os.path.join(ROOT, "RecompFolder")
     os.makedirs(dist_dir, exist_ok=True)
     dist_exe = os.path.join(dist_dir, "NexusRecomp.exe")
     shutil.copy2(exe_src, dist_exe)
 
     settings_path = os.path.join(dist_dir, "settings.txt")
-    with open(settings_path, "w", encoding="latin-1") as f:
-        f.write(
-            f"# Ratchet & Clank: Into the Nexus (PC Static Recompilation)\n"
-            f"# Tuned for Intel Xeon E5-2680 v4 (AVX2/FMA3) + AMD Radeon RX 9060 XT 16GB (4K 60fps)\n"
-            f"GAME={GAME_ROOT}\n"
-            f"RSX_RES_SCALE=3\n"
-            f"RACACIT_RES_SCALE=3.0\n"
-            f"RSX_SHADOW_SCALE=200\n"
-            f"RACACIT_ANISO=16\n"
-            f"RACACIT_TRILINEAR=1\n"
-            f"RACACIT_FPS=1\n"
-            f"RACACIT_PRESENT_PACE=1\n"
-            f"RACACIT_CPU_MODE=max\n"
-            f"RACACIT_UPSCALE=sharp\n"
-            f"RACACIT_SHARPNESS=5\n"
-            f"RACACIT_KBM=1\n"
-        )
+    if not os.path.exists(settings_path):
+        tmpl = os.path.join(ROOT, "settings.template.txt")
+        if os.path.exists(tmpl):
+            txt = open(tmpl, "r", encoding="utf-8", errors="ignore").read()
+            lines = [f"GAME={os.path.join(GAME_ROOT, 'PS3_GAME')}" if l.startswith("GAME=") else l for l in txt.splitlines()]
+            open(settings_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
     log(f"Staged ready-to-play build at: {dist_exe}")
+
+    if os.environ.get("NEXUS_NO_SMOKE", "0") == "1":
+        return
 
     # Run a 35-second automated boot verification test with PAD_AUTOPRESS=1 to inspect log.txt
     log("Running 35-second boot verification test of NexusRecomp.exe (with PAD_AUTOPRESS=1) ...")

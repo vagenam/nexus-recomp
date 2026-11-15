@@ -87,7 +87,7 @@ if(WIN32 AND NOT MSVC)
     set(RACACIT_LIFTED_FLAGS "-fno-auto-import")
 endif()
 if(NOT ANDROID AND (WIN32 OR CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86_64"))
-    set(RACACIT_SIMD_FLAGS "-march=broadwell;-mtune=broadwell;-mavx2;-mfma;-mbmi;-mbmi2")
+    set(RACACIT_SIMD_FLAGS "-march=haswell;-mtune=haswell;-mavx2;-mfma;-mbmi;-mbmi2")
     set(PS3RECOMP_AVX2 ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
@@ -239,7 +239,7 @@ if(SPU_SOURCES)
         # fallback was ~60% of the audio mixer's time -- the game's music fell
         # three blocks in four behind real time). Every x86-64 CPU since 2008.
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND NOT ANDROID)
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O3;-msse4.1;-ffp-contract=off;${RACACIT_SIMD_FLAGS};${RACACIT_LIFTED_FLAGS}")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-O3;-msse4.1;-ffp-contract=off;${RACACIT_SIMD_FLAGS};${RACACIT_LIFTED_FLAGS}")
             # The hot modules together in the exe (scripts/dev/hot_funcs.py).
             if(WIN32 AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/hot_spu_modules.cmake")
                 include("${CMAKE_CURRENT_LIST_DIR}/hot_spu_modules.cmake")

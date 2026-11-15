@@ -22,14 +22,13 @@ extern uint8_t* vm_base;
  * (with WRITE_WATCH_FLAG_RESET an overflowing call would lose pages). */
 static const struct { uint32_t ea; uint32_t size; } s_ranges[] = {
     { 0x20000000u, 0x10000000u },        /* the title's heap: vertex/index/texture data */
-    { 0x40000000u, 0x10000000u },
     { 0xC0000000u, 0x10000000u },        /* RSX local memory */
 };
 /* The 256 MB pieces above, as a mask of ea >> 28 (where A Crack in Time's
  * draws read from, RSX_WW_LOG=1). Anything outside them is not polled -- and
  * so always reported as written, i.e. hashed as before. Each polled piece
  * costs; all 4 GB was ~1.3 ms a pass. */
-#define WW_POLLED_MASK 0x1014u
+#define WW_POLLED_MASK 0x1004u
 unsigned long long g_rsx_ww_poll_us, g_rsx_ww_polls, g_rsx_ww_pages;   /* RSX_ENG_STATS */
 unsigned long long g_rsx_ww_heap_us, g_rsx_ww_heap_polls, g_rsx_ww_range_us[3];   /* ...split: heap-only polls; full polls per range */
 
@@ -67,15 +66,21 @@ void rsx_ww_poll(void) { ww_poll_ranges(sizeof s_ranges / sizeof s_ranges[0]); }
  * page written outside it, or in another range, is stamped by the next full
  * poll instead, with a later epoch: still after any check made in between, as
  * it was without this poll. */
+/* Only s_ranges[0], the heap, and of it only the span full polls have seen
+ * written. */
 static uint64_t s_heap_lo = ~0ull, s_heap_hi;
+static uint64_t s_range_lo[2] = { ~0ull, ~0ull }, s_range_hi[2];
 unsigned rsx_ww_heap_span_mb(void) { return s_heap_lo < s_heap_hi ? (unsigned)((s_heap_hi - s_heap_lo) >> 20) : 0u; }
 void rsx_ww_poll_heap(void) { ww_poll_ranges(1); }
 
 static void ww_poll_ranges(unsigned nr)
 {
     if (!rsx_ww_on()) return;
-    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
     s_epoch++;
+    static unsigned s_full_ctr = 0;
+    const int do_full = (nr > 1) && ((s_full_ctr++ & 31u) == 0);
     for (unsigned r = 0; r < nr; r++) {
         ULONG_PTR n = WW_BUF; DWORD gran = 0;
         uint8_t* base = vm_base + s_ranges[r].ea;
@@ -83,6 +88,9 @@ static void ww_poll_ranges(unsigned nr)
         if (nr == 1) {
             if (s_heap_lo >= s_heap_hi) break;
             base = vm_base + s_heap_lo; size = (SIZE_T)(s_heap_hi - s_heap_lo);
+        } else if (!do_full && r < 2 && s_range_lo[r] < s_range_hi[r]) {
+            base = vm_base + s_range_lo[r];
+            size = (SIZE_T)(s_range_hi[r] - s_range_lo[r]);
         }
         LARGE_INTEGER r0; QueryPerformanceCounter(&r0);
         const UINT gw = GetWriteWatch(WRITE_WATCH_FLAG_RESET, base, size, s_buf, &n, &gran);
@@ -93,6 +101,10 @@ static void ww_poll_ranges(unsigned nr)
         for (ULONG_PTR i = 0; i < n; i++) {
             const uint64_t off = (uint64_t)((uint8_t*)s_buf[i] - vm_base);
             if (off < WW_SPACE) s_page[off >> WW_PAGE_SHIFT] = s_epoch;
+            if (nr > 1 && r < 2) {
+                if (off < s_range_lo[r]) s_range_lo[r] = off;
+                if (off + (1u << WW_PAGE_SHIFT) > s_range_hi[r]) s_range_hi[r] = off + (1u << WW_PAGE_SHIFT);
+            }
             if (r == 0 && nr > 1) {
                 if (off < s_heap_lo) s_heap_lo = off;
                 if (off + (1u << WW_PAGE_SHIFT) > s_heap_hi) s_heap_hi = off + (1u << WW_PAGE_SHIFT);

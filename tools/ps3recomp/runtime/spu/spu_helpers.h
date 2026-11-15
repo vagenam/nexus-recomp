@@ -725,12 +725,12 @@ SPU_XF_CMP2(spu_fceq_exact, x == y)
 SPU_XF_CMP2(spu_fcgt_exact, x > y)
 static inline __attribute__((always_inline)) u128 spu_fceq(u128 a, u128 b) {
     const __m128 va = _mm_loadu_ps(a._f32), vb = _mm_loadu_ps(b._f32);
-    if (__builtin_expect(!spu_xf_e255_v(_mm_castps_si128(va)) & !spu_xf_e255_v(_mm_castps_si128(vb)), 1)) {
+    if (__builtin_expect((int)!spu_xf_e255_v(_mm_castps_si128(va)) & (int)!spu_xf_e255_v(_mm_castps_si128(vb)), 1)) {
         u128 r; _mm_storeu_ps(r._f32, _mm_cmpeq_ps(va, vb)); return r; }
     return spu_fceq_exact(a, b); }
 static inline __attribute__((always_inline)) u128 spu_fcgt(u128 a, u128 b) {
     const __m128 va = _mm_loadu_ps(a._f32), vb = _mm_loadu_ps(b._f32);
-    if (__builtin_expect(!spu_xf_e255_v(_mm_castps_si128(va)) & !spu_xf_e255_v(_mm_castps_si128(vb)), 1)) {
+    if (__builtin_expect((int)!spu_xf_e255_v(_mm_castps_si128(va)) & (int)!spu_xf_e255_v(_mm_castps_si128(vb)), 1)) {
         u128 r; _mm_storeu_ps(r._f32, _mm_cmpgt_ps(va, vb)); return r; }
     return spu_fcgt_exact(a, b); }
 #elif defined(__aarch64__)

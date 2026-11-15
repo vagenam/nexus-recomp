@@ -48,6 +48,7 @@ extern "C" void ppu_threads_dump_stacks(ppu_context* main_ctx);
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <limits.h>
 #ifndef _WIN32
@@ -136,32 +137,6 @@ static void stall_line(const char* what, uint32_t ea)
     fprintf(stderr, "%c", 10);
 }
 
-static void racacit_stall_jobs_dump(void)
-{
-    const uint32_t b = stall_be32(stall_be32(0xD2FAA4u) - 0x8000u);
-    if (b) {
-        fprintf(stderr, "[stall-jobs] igPm block 0x%08X, frame word %08X%c", b, stall_be32(b + 4), 10);
-        for (uint32_t q = 0; q < 5; q++)
-            fprintf(stderr, "[stall-jobs]   queue %u: done %08X posted %08X  99A8 %08X  kick line 0x%08X%c", q,
-                    stall_be32(b + 0x9480 + 0x80 * q), stall_be32(b + 0x9700 + 0x80 * q),
-                    stall_be32(b + 0x99A8 + 4 * q), stall_be32(b + 0x9994 + 4 * q), 10);
-        for (uint32_t q = 0; q < 5; q++) {
-            const uint32_t k = stall_be32(b + 0x9994 + 4 * q);
-            if (k) stall_line("kick", k);
-        }
-    }
-    const uint32_t m = stall_be32(stall_be32(0xD2F988u) - 0x7FD8u);
-    if (m) {
-        /* A doubleword, zeroed by job_wait once the job is done: non-zero = still waited on. */
-        const uint32_t hi = stall_be32(m + 0x3B0), h = stall_be32(m + 0x3B4);
-        fprintf(stderr, "[stall-jobs] moby_prerender handle %08X%08X: queue %u target %u%s frame %u%c",
-                hi, h, (h >> 10) & 7, h & 0x3FF, (h & 0x2000) ? " (other path)" : "", h >> 14, 10);
-    }
-    stall_line("jobmgr", 0x00F3CE00u);
-    stall_line("jobmgr", 0x00F3CE80u);
-    stall_line("jobmgr", 0x00F3CF00u);
-}
-
 /* Guest-callback dispatch. g_ps3_guest_caller is the hook the HLE runtime
  * calls back into recompiled code through -- cellSysutil events and the GCM
  * vblank/flip handlers. ppu_guest_call does the OPD -> dispatch. */
@@ -178,6 +153,9 @@ int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
 extern void (*g_gcm_wake_walker)(void);       /* wake frame_clock for a drain now */
+#ifdef RACACIT_PGO_GEN
+int __llvm_profile_write_file(void);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -301,13 +279,16 @@ static unsigned long long s_rt_present_us;
 extern "C" void ps3_tl_at(unsigned long long t, char ev, uint32_t a, uint32_t b);
 extern "C" void ps3_tl(char ev, uint32_t a, uint32_t b);
 extern "C" unsigned long long ps3_qpc_us(void);
+#include <stdlib.h>
+#include <math.h>
 static void present_guest_frame(void)
 {
     unsigned long long _t = rt_now_us();
     ps3_tl('P', 0, 0);
     rsx_backend_present();
-    s_rt_present_us += rt_now_us() - _t;
-    g_rt_present_total_us += rt_now_us() - _t;
+    unsigned long long _now = rt_now_us();
+    s_rt_present_us += _now - _t;
+    g_rt_present_total_us += _now - _t;
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
@@ -563,8 +544,11 @@ static void racacit_memlog(unsigned long long now_us)
 #endif
 
 extern "C" int cellGcm_fifo_pending(void);
+extern "C" int ps3_host_place_thread(int role, int idx);
+extern "C" void ps3_host_placement_configure(int mode);
 static DWORD WINAPI frame_clock(LPVOID)
 {
+    ps3_host_place_thread(0, 0);
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "ps3recomp";
 #if defined(_WIN32) || defined(__ANDROID__)
@@ -662,7 +646,6 @@ static DWORD WINAPI frame_clock(LPVOID)
                         }
                         pk = (*end == ',') ? end + 1 : end;
                     } }
-                  racacit_stall_jobs_dump();
                   racacit_ring_dump();   /* RACACIT_LINE_RING: the line's recent history */
                   fflush(stderr);
               }
@@ -717,7 +700,9 @@ static DWORD WINAPI frame_clock(LPVOID)
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) timed_drain();
-            next_tick += tick_us;
+            { static unsigned boot_fast = (unsigned)-1;
+              if (boot_fast == (unsigned)-1) { const char* e = getenv("RACACIT_BOOT_FAST"); boot_fast = (e && *e) ? (unsigned)atoi(e) : 0u; }
+              next_tick += (boot_fast && cellGcm_flip_request_count() < boot_fast) ? 1000ull : tick_us; }
             fired++;
         }
         if (fired >= 240) next_tick = now_us;   /* fell too far behind -- resync */
@@ -739,7 +724,7 @@ static DWORD WINAPI frame_clock(LPVOID)
              * once per pass it was a quarter of this thread's busy time. */
             static unsigned long long s_pump_us;
             const unsigned long long pnow = rt_now_us();
-            const int pump = pnow - s_pump_us >= 4000;
+            const int pump = pnow - s_pump_us >= 8000;
             if (pump) s_pump_us = pnow;
             if (pump && rsx_backend_pump() != 0) {
                 /* Window closed: quit. Guest threads are still running and
@@ -748,6 +733,9 @@ static DWORD WINAPI frame_clock(LPVOID)
                 fflush(stdout); fflush(stderr);
 #ifdef _WIN32
                 racacit_log_flush();
+#ifdef RACACIT_PGO_GEN
+                __llvm_profile_write_file();
+#endif
                 TerminateProcess(GetCurrentProcess(), 0);
 #else
                 _exit(0);
@@ -1401,7 +1389,7 @@ static void windows_setup(int* argc, char*** argv)
     if (!getenv("RACACIT_HLE_SPURS")) _putenv_s("RACACIT_HLE_SPURS", "1");
     if (!getenv("PS3RECOMP_VK_GUEST_PROGRAMS")) _putenv_s("PS3RECOMP_VK_GUEST_PROGRAMS", "1");
     if (!getenv("PS3RECOMP_VK_WINDOW")) _putenv_s("PS3RECOMP_VK_WINDOW", "1");
-    if (!getenv("PS3_TITLE")) _putenv_s("PS3_TITLE", "Ratchet & Clank: Into the Nexus");
+    if (!getenv("PS3_TITLE")) _putenv_s("PS3_TITLE", "RACcoon - Ratchet & Clank: Into the Nexus");
     if (!getenv("RSX_RES_SCALE")) _putenv_s("RSX_RES_SCALE", "1");
     if (!getenv("RSX_SHADOW_SCALE")) _putenv_s("RSX_SHADOW_SCALE", "100");
     /* Translated shaders and driver pipelines, kept across runs: the first
@@ -1547,6 +1535,7 @@ int main(int argc, char** argv)
      * inflates every shorter wait the title makes and throttles the whole
      * thing. POSIX timers are already fine-grained. */
     timeBeginPeriod(1);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     /* Windows may slow a process it decides is in the background, park it on a
      * hybrid CPU's efficiency cores, and (Windows 11) ignore its timer resolution
      * when the window is covered: all of it stutter here, where every thread paces
@@ -1618,10 +1607,12 @@ int main(int argc, char** argv)
 
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
+    ps3_host_placement_configure(-1);   /* HOST_PLACEMENT=auto (off|0-3 overrides) */
     g_ps3_guest_caller = harness_guest_caller;
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
     if (getenv("PS3_PEEK")) CreateThread(NULL, 0, peek_thread, NULL, 0, NULL);
 
+    ps3_host_place_thread(2, 0);        /* PPU main thread (active on HOST_PLACEMENT=3 / hybrid P-cores) */
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 

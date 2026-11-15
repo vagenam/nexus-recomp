@@ -322,6 +322,8 @@ void rsx_draw_engine_flush(void);
 void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
+/* A flip decoded in FIFO order (0xFEADxxxx / 0xE920). */
+int rsx_draw_engine_fifo_flip(u32 buffer_id);
 /* An NV3089 scaled-image blit whose ends may be GPU targets (locations are
  * RSX_LOCATION_*; rectangles in pixels). Copies depth to depth when the
  * source is a tracked depth buffer, else colour to colour when both ends are

@@ -36,7 +36,7 @@
 /* ---- ring --------------------------------------------------------------- */
 
 #define PX_RING_BYTES   (64u << 20)
-#define PX_BIG          (256u << 10)     /* payloads above this live in a heap block */
+#define PX_BIG          (4u << 20)      /* payloads above this live in a heap block */
 #define PX_ALIGN(n)     (((n) + 15u) & ~15u)
 
 enum {
@@ -45,7 +45,8 @@ enum {
     OP_PIPE_CREATE, OP_PIPE_RELEASE, OP_BIND_TARGETS, OP_BIND_PIPE, OP_VS_CONST, OP_PS_CONST,
     OP_BIND_TEX, OP_BIND_VTEX, OP_VIEWPORT, OP_SCISSOR, OP_STENCIL_REF, OP_DRAW, OP_CLEAR_COLOR,
     OP_CLEAR_DS, OP_PRESENT, OP_GEOM_UPLOAD, OP_GEOM_RELEASE, OP_DRAW_CACHED, OP_SUBMIT, OP_VS_DELTA,
-    OP_DRAW_CACHED_VI, OP_DEPTH_BIAS, OP_BLEND_COLOR
+    OP_DRAW_CACHED_VI, OP_DEPTH_BIAS, OP_BLEND_COLOR,
+    OP_ZPASS_ENABLE, OP_ZPASS_CLEAR, OP_ZPASS_GET, OP_ZPASS_POLL, OP_ZPASS_DEFER_LABEL
 };
 
 typedef struct { u32 op, bytes; } px_hdr;   /* bytes: the whole record, aligned */
@@ -127,6 +128,7 @@ static void key_drop_owner(u32 owner)
 /* RSX_BACKEND_THREAD_STATS=1: where each side waits, every 240 presents. */
 static int s_stats = -1;
 static unsigned long long st_sync, st_sync_us, st_room, st_room_us, st_thr, st_thr_us, st_busy_us, st_bytes, st_cmds;
+unsigned long long g_rsx_proxy_thr_us;
 static unsigned long long px_us(void)
 {
     LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
@@ -175,13 +177,15 @@ static void px_wait_until(unsigned long long t)
 /* Live from Settings > Graphics > Frame pacing (rsx_host_ui.c); -1 = not set
  * there, RACACIT_PRESENT_PACE decides. */
 volatile int g_racacit_present_pace = -1;
+volatile int g_racacit_fps_limit = 0; /* 0 = unlimited, 30 / 60 / 120 */
 static void px_pace_present(u32 surface)
 {
     static u32 pc_last_surface; static unsigned long long pc_last_call;
     if (s_pace < 0) { const char* e = getenv("RACACIT_PRESENT_PACE"); s_pace = (e && *e == '1') ? 1 : 0;
                       s_pace_stats = getenv("RACACIT_PACE_STATS") ? 1 : 0; }
     if (g_racacit_present_pace >= 0) s_pace = g_racacit_present_pace;
-    if (!s_pace && !s_pace_stats) return;
+    const int fps_lim = g_racacit_fps_limit;
+    if (!s_pace && !s_pace_stats && fps_lim <= 0) return;
     const unsigned long long ready = px_us();
     /* Each flip is presented twice (the FIFO's flip word and the present
      * thread's own present, rsx_draw_engine_present_buffer): the second, the
@@ -206,7 +210,11 @@ static void px_pace_present(u32 surface)
     /* Paced only for a steady game between 25 and 100 fps, and only by up
      * to half a period: a frame further ahead means the schedule is stale
      * (a load, a menu) and it goes now, starting a new one. */
-    if (s_pace && pc_last_present && pc_period >= 10000.0 && pc_period <= 40000.0) {
+    if (fps_lim > 0 && pc_last_present) {
+        const unsigned long long target = 1000000ull / (unsigned long long)fps_lim;
+        const unsigned long long due = pc_last_present + target;
+        if (due > ready && due - ready <= 100000ull && due > at) at = due;
+    } else if (s_pace && pc_last_present && pc_period >= 10000.0 && pc_period <= 40000.0) {
         /* A game near 60 fps paces itself to 60 Hz: use that, not the
          * noisy average, or the schedule runs early and holds nothing. */
         const double per = pc_period > 15000.0 && pc_period < 18500.0 ? 1e6 / 60.0
@@ -255,6 +263,18 @@ static void px_publish(void)
     px_wake_worker();
 }
 
+/* Wait on s_cv_room with s_lk held, then pump inter-thread sent Win32 messages
+ * (never posted input/timers) so HWND-owning producers cannot deadlock px_worker. */
+static inline void px_wait_room_ms(DWORD ms)
+{
+    SleepConditionVariableSRW(&s_cv_room, &s_lk, ms, 0);
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_lk);
+    { MSG m; PeekMessageW(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE); }
+    AcquireSRWLockExclusive(&s_lk);
+#endif
+}
+
 static u8* px_reserve(u32 n)
 {
     for (;;) {
@@ -274,12 +294,17 @@ static u8* px_reserve(u32 n)
             return s_ring + off;
         }
         px_publish();
-        const unsigned long long t0 = s_stats > 0 ? px_us() : 0;
+        const unsigned long long t0 = px_us();
         AcquireSRWLockExclusive(&s_lk);
         if (PX_RING_BYTES - (s_wl - atomic_load(&s_r)) < need)
-            SleepConditionVariableSRW(&s_cv_room, &s_lk, 1, 0);
+            px_wait_room_ms(1);
         ReleaseSRWLockExclusive(&s_lk);
-        if (s_stats > 0) { st_room++; st_room_us += px_us() - t0; }
+        { const unsigned long long dt = px_us() - t0;
+          if (s_stats > 0) { st_room++; st_room_us += dt; }
+          if (dt > 2000ull) {
+              static u32 n_st;
+              if (n_st < 40u) { n_st++; fprintf(stderr, "[px-stall] ring room wait %.1fms (need=%u)\n", dt / 1000.0, need); }
+          } }
     }
 }
 static inline void px_commit(u8* rec, u32 n)
@@ -330,6 +355,8 @@ typedef struct { u32 src, sx, sy, sw, sh, dst, dx, dy, dw, dh; } r_blit;
 typedef struct { u32 v; rsx_be_render_state rs; rsx_vertex_layout_plan layout; u32 stride; rsx_be_format rt_fmt; u32 rt_count; px_blob vs, ps; } r_pipe;
 typedef struct { u32 count, depth, s[RSX_BE_MAX_COLOR_TARGETS]; } r_targets;
 typedef struct { u32 v; } r_one;
+typedef struct { u32 idx, dma, off; } r_zget;
+typedef struct { u32 ea, val; } r_zlabel;
 typedef struct { float units, factor; } r_bias;
 typedef struct { float c[4]; } r_blend_c;
 typedef struct { u32 bytes; px_blob data; } r_const;
@@ -436,6 +463,13 @@ static void px_replay(const u8* rec)
         s_real->draw_cached_vi(u, a->topo, tr(a->geom), a->vcount, a->stride, (const u32*)px_blob_ptr(rec, &a->i), a->icount, a->vofs);
         free(a->i.heap); break; }
     case OP_SUBMIT: { const r_one* a = (const void*)b; if (s_real->submit_and_wait) s_real->submit_and_wait(u, a->v); break; }
+    case OP_ZPASS_ENABLE: { const r_one* a = (const void*)b; extern void rsx_vk_zpass_set_enable(u32); rsx_vk_zpass_set_enable(a->v); break; }
+    case OP_ZPASS_CLEAR: { const r_one* a = (const void*)b; extern void rsx_vk_zpass_clear(u32); rsx_vk_zpass_clear(a->v); break; }
+    case OP_ZPASS_GET: { const r_zget* a = (const void*)b; extern void rsx_vk_zpass_tag_report_ex(u32, u32, u32); rsx_vk_zpass_tag_report_ex(a->idx, a->dma, a->off); break; }
+    case OP_ZPASS_POLL: { extern void rsx_vk_zpass_poll(void); rsx_vk_zpass_poll(); break; }
+    case OP_ZPASS_DEFER_LABEL: { const r_zlabel* a = (const void*)b; extern int rsx_vk_zpass_defer_label(u32, u32);
+        if (!rsx_vk_zpass_defer_label(a->ea, a->val)) { extern void vm_write32(uint32_t, uint32_t); vm_write32(a->ea, a->val); }
+        break; }
     default: break;
     }
 }
@@ -505,7 +539,7 @@ static void px_sync(void)
     AcquireSRWLockExclusive(&s_lk);
     WakeAllConditionVariable(&s_cv_work);
     while (atomic_load(&s_r) != s_wl || !atomic_load(&s_worker_idle))
-        SleepConditionVariableSRW(&s_cv_room, &s_lk, 1, 0);
+        px_wait_room_ms(1);
     ReleaseSRWLockExclusive(&s_lk);
     if (s_stats > 0) st_sync_us += px_us() - t0;
 }
@@ -784,9 +818,11 @@ static void p_present(void* user, u32 s)
     if (atomic_load(&s_presents) > 2) {
         const unsigned long long t0 = s_stats > 0 ? px_us() : 0;
         AcquireSRWLockExclusive(&s_lk);
-        while (atomic_load(&s_presents) > 2) SleepConditionVariableSRW(&s_cv_room, &s_lk, 2, 0);
+        while (atomic_load(&s_presents) > 2) px_wait_room_ms(2);
         ReleaseSRWLockExclusive(&s_lk);
-        if (s_stats > 0) { st_thr++; st_thr_us += px_us() - t0; }
+        { const unsigned long long _d = px_us() - t0;
+          extern unsigned long long g_rsx_proxy_thr_us; g_rsx_proxy_thr_us += _d;
+          if (s_stats > 0) { st_thr++; st_thr_us += _d; } }
     }
     static unsigned n_presents; static unsigned long long t_last;
     if (s_stats > 0 && ++n_presents % 240u == 0) {
@@ -875,4 +911,68 @@ const rsx_draw_backend* rsx_be_proxy_wrap(const rsx_draw_backend* real)
     };
     fprintf(stderr, "[be-proxy] the draw backend runs on its own thread (RSX_BACKEND_THREAD)%c", 10);
     return &s_proxy;
+}
+
+void rsx_be_zpass_set_enable(u32 enable)
+{
+    if (s_ring && s_real) { PX_SIMPLE(OP_ZPASS_ENABLE, r_one, enable); }
+    else { extern void rsx_vk_zpass_set_enable(u32); rsx_vk_zpass_set_enable(enable); }
+}
+void rsx_be_zpass_clear(u32 type)
+{
+    if (s_ring && s_real) { PX_SIMPLE(OP_ZPASS_CLEAR, r_one, type); }
+    else { extern void rsx_vk_zpass_clear(u32); rsx_vk_zpass_clear(type); }
+}
+void rsx_be_zpass_get_report_async(u32 idx, u32 dma, u32 off)
+{
+    extern void rsx_vk_zpass_tag_report_ex(u32, u32, u32);
+    if (s_ring && s_real) {
+        u32 tot = PX_ALIGN((u32)sizeof(px_hdr) + (u32)sizeof(r_zget));
+        u8* rec = px_reserve(tot);
+        px_hdr* h = (px_hdr*)rec; h->op = OP_ZPASS_GET; h->bytes = tot;
+        r_zget* a = (r_zget*)(rec + sizeof(px_hdr)); a->idx = idx; a->dma = dma; a->off = off;
+        px_commit(rec, tot);
+    } else {
+        rsx_vk_zpass_tag_report_ex(idx, dma, off);
+    }
+}
+void rsx_be_zpass_flush(void)
+{
+    rsx_be_zpass_clear(0xFFFFFFFFu);
+    if (s_ring && s_real) px_sync();
+}
+void rsx_be_zpass_poll(void)
+{
+    if (s_ring && s_real) {
+        PX_SIMPLE(OP_ZPASS_POLL, r_one, 0u);
+    } else {
+        extern void rsx_vk_zpass_poll(void);
+        rsx_vk_zpass_poll();
+    }
+}
+int rsx_be_zpass_defer_label(u32 ea, u32 val)
+{
+    if (s_ring && s_real) {
+        u32 tot = PX_ALIGN((u32)sizeof(px_hdr) + (u32)sizeof(r_zlabel));
+        u8* rec = px_reserve(tot);
+        px_hdr* h = (px_hdr*)rec; h->op = OP_ZPASS_DEFER_LABEL; h->bytes = tot;
+        r_zlabel* a = (r_zlabel*)(rec + sizeof(px_hdr)); a->ea = ea; a->val = val;
+        px_commit(rec, tot);
+        return 1;
+    }
+    {
+        extern int rsx_vk_zpass_defer_label(u32 ea, u32 val);
+        return rsx_vk_zpass_defer_label(ea, val);
+    }
+}
+void rsx_be_zpass_get_report_sync(u32 idx, u32 dma, u32 off)
+{
+    rsx_be_zpass_get_report_async(idx, dma, off);
+    if (s_ring && s_real) px_sync();
+}
+u32 rsx_be_zpass_get_report(u32 idx)
+{
+    rsx_be_zpass_get_report_async(idx, 0u, 0u);
+    extern u32 rsx_vk_zpass_read_report(u32);
+    return rsx_vk_zpass_read_report(idx);
 }

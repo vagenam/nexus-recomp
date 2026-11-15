@@ -8,6 +8,8 @@
 #include "spu_context.h"
 #include "../platform/ps3_setjmp.h"   /* setjmp/longjmp that never unwind (Windows) */
 
+extern void spu_mfc_pending_pump(spu_context*);
+
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
     jmp_buf               env;
@@ -31,11 +33,11 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 typedef struct { char k; uint32_t pc, ret, r0, r1, sp0, depth; int img; } spu_tr_ev;
 static SPU_THREAD_LOCAL spu_tr_ev s_tr[64];
 static SPU_THREAD_LOCAL unsigned s_tr_n;
+int g_spu_tr_on = -1;
 static int spu_tr_on(void)
 {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("SPU_TRACE_RING"); on = (e && *e == '1') ? 1 : 0; }
-    return on;
+    if (g_spu_tr_on < 0) { const char* e = getenv("SPU_TRACE_RING"); g_spu_tr_on = (e && *e == '1') ? 1 : 0; }
+    return g_spu_tr_on;
 }
 void spu_tr_note(spu_context* ctx, char k, uint32_t ret, uint32_t sp0)
 {
@@ -514,11 +516,10 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. Per thread: one shared ring was a cache line
      * every SPU thread wrote on every lifted call. */
-    enum { RING = 24 };
+    enum { RING = 32 };
     static _Thread_local uint32_t s_ring[RING];
     static _Thread_local uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
+    s_ring[s_n++ & (RING - 1u)] = ((uint32_t)ctx->pc & SPU_LS_MASK);
 
     if (ctx->host_depth < s_max) return;
     static int s_reported = 0;
@@ -602,8 +603,10 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             ctx->drain_ret_sp = sp0;
-            yz_lockstep_tick(ctx);
+            { extern volatile int g_yz_lockstep_on;
+              if (__builtin_expect(g_yz_lockstep_on != 0, 0)) yz_lockstep_tick(ctx); }
             spu_task_launch_check(ctx, (void*)fn);
+            if (__builtin_expect(ctx->mfc_list_pending, 0)) spu_mfc_pending_pump(ctx);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

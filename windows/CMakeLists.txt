@@ -4,7 +4,18 @@ project(nexus_windows C CXX)
 get_filename_component(NEXUS_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
 if(NOT MSVC)
-    add_compile_options(-fomit-frame-pointer -fno-math-errno -march=broadwell -mtune=broadwell)
+    add_compile_options(
+        -fomit-frame-pointer
+        -fno-math-errno
+        -march=haswell
+        -mtune=haswell
+        -Wno-unused-label
+        -Wno-unused-function
+        -Wno-bitwise-instead-of-logical
+        -Wno-misleading-indentation
+        -Wno-macro-redefined
+        -Wno-comment
+    )
 endif()
 
 list(APPEND CMAKE_PREFIX_PATH "${NEXUS_ROOT}/tools/sdl2-win")

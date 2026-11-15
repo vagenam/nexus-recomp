@@ -4986,7 +4986,7 @@ static const float* dc_vertex_attr_canonical(
             ref->vertex_id, ref->base_index, fetch->desc.frequency,
             (dc.fetch_plan.divider_mask >> attr) & 1u);
         const u64 offset =
-            (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
+            (u64)rsx_dsp_resolve_vertex_offset(dc.fetch_plan.base_offset, fetch->desc.offset) +
             (u64)element * fetch->stride;
         if (offset <= UINT32_MAX) {
             const u8* source = guest_ptr(

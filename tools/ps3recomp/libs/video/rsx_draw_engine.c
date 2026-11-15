@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #if defined(_WIN32)
 #include <direct.h>
 #define mkdir(p, m) _mkdir(p)
@@ -94,18 +95,20 @@ static inline u64 eng_cycles(void)
 static inline u64 eng_rdtsc(void)
 {
     if (__builtin_expect(s_eng_prof <= 0, 1)) {
-        if (s_eng_prof < 0) s_eng_prof = getenv("RSX_ENG_STATS") ? 1 : 0;
+        if (s_eng_prof < 0) { const char* e = getenv("RSX_ENG_STATS"); s_eng_prof = (e && *e && *e != '0') ? 1 : 0; }
         if (!s_eng_prof) return 0;
     }
     return eng_cycles();
 }
+unsigned long long g_rsx_draws = 0, g_rsx_gmiss = 0, g_rsx_vb_build = 0, g_rsx_tex_hash = 0, g_rsx_gfetch_us = 0;
+unsigned long long g_rsx_gf_hit_us = 0, g_rsx_gf_vb_us = 0, g_rsx_gf_bld_us = 0, g_rsx_vb_dirty = 0, g_rsx_geom_prom = 0;
 /* The frame-drop report's few (RSX_HITCH): two a draw and the rare events. It used to
  * turn on all the stage counters above too, a few dozen rdtsc a draw for numbers it never printed. */
 static int s_eng_hf = -1;
 static inline u64 eng_hf_tsc(void)
 {
     if (__builtin_expect(s_eng_hf <= 0, 1)) {
-        if (s_eng_hf < 0) s_eng_hf = (getenv("RSX_ENG_STATS") || getenv("RSX_HITCH")) ? 1 : 0;
+        if (s_eng_hf < 0) { const char* e1 = getenv("RSX_ENG_STATS"); const char* e2 = getenv("RSX_HITCH"); s_eng_hf = ((e1 && *e1 && *e1 != '0') || (e2 && *e2 && *e2 != '0')) ? 1 : 0; }
         if (!s_eng_hf) return 0;
     }
     return eng_cycles();
@@ -182,6 +185,7 @@ typedef struct {
     u8  srgb_written;                     /* its last draw ran with the sRGB write (eng_pipeline_get) */
     u32 edge_w, edge_h;                   /* eng_copy_target_edges: the texture size its edges */
     u64 edge_serial;                      /* were last spread for, and last_write then */
+    u32 alias_off;                        /* clip-origin texture alias (offset + clip_y*pitch + clip_x*4) */
 } eng_surface;
 
 typedef struct {
@@ -200,6 +204,8 @@ typedef struct {
     u64 last_use;          /* g.surf_serial at the last bind: LRU eviction */
     u64 last_write;        /* g.surf_serial at the last depth-writing draw  */
     u32 snap_w, snap_h;    /* the snapshot texture's size (0 = the used area) */
+    u32 snapshot_spare, snap_spare_w, snap_spare_h;
+    int snapshot_spare_valid;
     u32 ww_epoch;          /* rsx_ww epoch of the last depth write or clear */
     u32 ww_check_frame;    /* g.frames + 1 when ww_stale was last computed */
     u8  ww_stale;          /* the game wrote its memory after that */
@@ -271,6 +277,7 @@ static struct {
     u32 last_present_surface;
     u64 surf_serial;
     u32 last_flip_buffer;
+    u32 sink_flips;          /* flips decoded from the FIFO, in draw order */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -831,9 +838,12 @@ static void eng_addr_index(void)
  * order: for (i = eng_surf_first(l, o); i != ENG_INVALID; i = eng_surf_next(i)). */
 static inline u32 eng_surf_from(u32 link, u32 location, u32 offset)
 {
-    for (; link; link = g.surf_next[link - 1u])
-        if (g.surfaces[link - 1u].location == location && g.surfaces[link - 1u].offset == offset)
+    for (; link; link = g.surf_next[link - 1u]) {
+        const eng_surface* s = &g.surfaces[link - 1u];
+        if (s->location == location &&
+            (s->offset == offset || (s->alias_off && s->alias_off == offset)))
             return link - 1u;
+    }
     return ENG_INVALID;
 }
 static inline u32 eng_surf_first(u32 location, u32 offset)
@@ -873,6 +883,16 @@ static u32 eng_surface_find(u32 location, u32 offset, u32 w, u32 h)
         if (w && s->w == w && s->h == h &&
             (exact == ENG_INVALID || s->last_write > g.surfaces[exact].last_write)) exact = i;
         if (best == ENG_INVALID || s->last_write > g.surfaces[best].last_write) best = i;
+    }
+    if (exact == ENG_INVALID && best == ENG_INVALID) {
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            const eng_surface* s = &g.surfaces[i];
+            if (s->handle && s->location == location && s->alias_off && s->alias_off == offset) {
+                if (w && s->w == w && s->h == h &&
+                    (exact == ENG_INVALID || s->last_write > g.surfaces[exact].last_write)) exact = i;
+                if (best == ENG_INVALID || s->last_write > g.surfaces[best].last_write) best = i;
+            }
+        }
     }
     return exact != ENG_INVALID ? exact : best;
 }
@@ -1119,6 +1139,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->own_snap = 0; s->own_snap_of = 0; s->own_snap_at = 0;
     s->last_use = ++g.surf_serial;
     s->draws_since_present = 0;
+    s->alias_off = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     s_hf.surfs++;
     g.addr_dirty = 1;
@@ -1165,6 +1186,15 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     /* SET_SURFACE_COLOR_TARGET 2 selects B alone; every other value starts at
      * A, and the MRT selectors add B, C and D on top of it. */
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
+    for (u32 b = 0; b < 8; b++) {
+        const eng_display_buffer* d = &g.display_buffers[b];
+        if (d->valid && d->location == sf.color_location[sel] &&
+            d->offset == sf.color_offset[sel] && d->width == sf.clip_w &&
+            sf.clip_h > 0 && sf.clip_h < d->height) {
+            sf.clip_h = d->height;
+            break;
+        }
+    }
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
                                       sf.clip_w, sf.clip_h, fmt);
@@ -1173,6 +1203,14 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     g.surfaces[first].rsx_fmt = sf.color_format & 0x1Fu;
     g.surfaces[first].copy_h = 0;                 /* drawn into: every row is the GPU's */
     g.surfaces[first].raster = sf.raster_type;
+    if (fmt == RSX_BE_FMT_R8G8B8A8 && sf.color_pitch[sel]) {
+        const u32 al = (sf.clip_x || sf.clip_y)
+            ? sf.color_offset[sel] + sf.clip_y * sf.color_pitch[sel] + sf.clip_x * 4u : 0u;
+        if (g.surfaces[first].alias_off != al) {
+            g.surfaces[first].alias_off = al;
+            g.bind_epoch++;
+        }
+    }
     slots[0] = first;
     u32 n = 1;
 
@@ -1221,7 +1259,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         const u32 uw = rt_w < z->w ? rt_w : z->w, uh = rt_h < z->h ? rt_h : z->h;
         if (uw != z->used_w || uh != z->used_h) {   /* copies of the old area are stale */
             z->used_w = uw; z->used_h = uh;
-            z->snapshot_valid = 0; z->as_color_valid = 0;
+            z->snapshot_valid = 0; z->snapshot_spare_valid = 0; z->as_color_valid = 0;
         }
     }
     return slot;
@@ -1378,6 +1416,8 @@ static u32 eng_zdepth_get_alloc(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->last_write = 0;
     z->ww_epoch = 0; z->ww_check_frame = 0; z->ww_stale = 0;   /* a new buffer: no verdict of the old one */
     z->snapshot_valid = 0;
+    z->snapshot_spare = 0;
+    z->snapshot_spare_valid = 0;
     if (z->as_color) g.be->color_target_release(g.be->user, z->as_color);
     z->as_color = 0;
     z->as_color_valid = 0;
@@ -1407,14 +1447,25 @@ static u32 eng_zdepth_snapshot_tex(u32 slot, u32 tex_w, u32 tex_h)
     const u32 uw = z->used_w ? z->used_w : z->w, uh = z->used_h ? z->used_h : z->h;
     if (!g.be->depth_snapshot_sized || (tex_w == uw && tex_h == uh)) tex_w = tex_h = 0;
     if (z->snapshot_valid && z->snapshot && z->snap_w == tex_w && z->snap_h == tex_h) return z->snapshot;
+    if (z->snapshot_spare_valid && z->snapshot_spare && z->snap_spare_w == tex_w && z->snap_spare_h == tex_h) return z->snapshot_spare;
     if (!g.be->depth_snapshot) return 0;
     s_snap_builds++; s_hf.snaps++;
     const u64 c0_ = eng_hf_tsc();
+    extern unsigned long long ps3_qpc_us(void);
+    extern unsigned long long g_rsx_dsnap_us;
+    const unsigned long long dt0_ = ps3_qpc_us();
     const u32 tex = (tex_w && tex_h)
         ? g.be->depth_snapshot_sized(g.be->user, z->handle, uw, uh, tex_w, tex_h)
         : g.be->depth_snapshot(g.be->user, z->handle, uw, uh);
+    g_rsx_dsnap_us += ps3_qpc_us() - dt0_;
     s_hf.snap_cyc += eng_hf_tsc() - c0_;
     if (!tex) return 0;
+    if (z->snapshot && (z->snap_w != tex_w || z->snap_h != tex_h) && z->snapshot != tex) {
+        z->snapshot_spare = z->snapshot;
+        z->snap_spare_w = z->snap_w;
+        z->snap_spare_h = z->snap_h;
+        z->snapshot_spare_valid = z->snapshot_valid;
+    }
     z->snapshot = tex;
     z->snapshot_valid = 1;
     z->snap_w = tex_w; z->snap_h = tex_h;
@@ -1613,7 +1664,7 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     const u64 t0 = eng_rdtsc();
     const u64 hash = span >= 256 ? eng_hash_long(src, span, 0x746578ull) : eng_hash_bytes(src, span, 0x746578ull);
     s_tex_hash_cyc += eng_rdtsc() - t0;
-    s_tex_hash_bytes += span; s_tex_hashes++;
+    s_tex_hash_bytes += span; s_tex_hashes++; g_rsx_tex_hash++;
     *readable = 1;
     return hash;
 }
@@ -1692,27 +1743,50 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     /* `into`: the guest rewrote a cached texture -- the same image takes the
      * new bytes. A fresh image and allocation per refresh was ~8 kernel
      * round trips a frame in Zolar Forest (its animated textures). */
+    const unsigned long long tu_t0 = ps3_qpc_us();
     const u32 skip = eng_tex_skip_levels(w, h, nlv);   /* texture quality */
     const u32 handle = into ? into
                             : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                                    lv[skip].w, lv[skip].h, nlv - skip, faces, remap, fmt);
     if (!handle) return 0;
+    const unsigned long long tu_t1 = ps3_qpc_us();
+    unsigned long long tu_dec = 0, tu_up = 0;
 
     for (u32 f = 0; f < faces; f++) {
         const u8* face = src + (size_t)f * face_stride;
         for (u32 m = skip; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
-            if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) {
-                if (!into) g.be->texture_release(g.be->user, handle);
-                return 0;
+            if (tl->compressed && tl->dst_row_bytes == tl->row_bytes) {
+                const unsigned long long u0 = ps3_qpc_us();
+                g.be->texture_upload(g.be->user, handle, f, m - skip, lv[m].w, lv[m].h,
+                                     face + lv[m].offset, tl->dst_row_bytes, tl->rows);
+                tu_up += ps3_qpc_us() - u0;
+            } else {
+                if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) {
+                    if (!into) g.be->texture_release(g.be->user, handle);
+                    return 0;
+                }
+                const unsigned long long d0 = ps3_qpc_us();
+                rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
+                                   face + lv[m].offset, lv[m].w, lv[m].h, tl,
+                                   rsx_texture_argb_is_rgba());
+                const unsigned long long u0 = ps3_qpc_us();
+                tu_dec += u0 - d0;
+                g.be->texture_upload(g.be->user, handle, f, m - skip, lv[m].w, lv[m].h,
+                                     g.tex_staging, tl->dst_row_bytes, tl->rows);
+                tu_up += ps3_qpc_us() - u0;
             }
-            rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
-                               face + lv[m].offset, lv[m].w, lv[m].h, tl,
-                               rsx_texture_argb_is_rgba());
-            g.be->texture_upload(g.be->user, handle, f, m - skip, lv[m].w, lv[m].h,
-                                 g.tex_staging, tl->dst_row_bytes, tl->rows);
         }
     }
+    { const unsigned long long tot = ps3_qpc_us() - tu_t0;
+      if (tot > 5000ull) {
+          static u32 n_slow;
+          if (n_slow < 40u) { n_slow++;
+              fprintf(stderr, "[tex-slow] frame %u: %u:0x%08X %ux%u fmt 0x%02X lv %u swz %d cmp %d: total=%.1fms (create=%.1fms dec=%.1fms up=%.1fms)\n",
+                      g.frames, location, offset, w, h, fmt, nlv - skip, lv[0].tl.swizzled, lv[0].tl.compressed,
+                      tot / 1000.0, (tu_t1 - tu_t0) / 1000.0, tu_dec / 1000.0, tu_up / 1000.0);
+          }
+      } }
     return handle;
 }
 
@@ -1989,7 +2063,7 @@ static struct {
 static int eng_park_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("RSX_PARK_WATCH"); on = !(e && *e == '0'); }
+    if (on < 0) { const char* e = getenv("RSX_PARK_WATCH"); on = (e && *e == '1') ? 1 : 0; }
     return on;
 }
 
@@ -2537,20 +2611,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         mc.biased = eng_biased_mask();
         mc.gamma = eng_gamma_mask();
         mc.tgen = g.rsx.tex_gen_all; mc.vgen = g.rsx.vtex_gen; mc.valid = 1;
+        memcpy(s_tm_dim, mc.dim, sizeof s_tm_dim);
     }
     const u32 cube_mask = mc.cube;
     const u32 vtex_mask = mc.vtex;
-    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
-    memcpy(unnorm_dim, mc.dim, sizeof unnorm_dim);
+    const u32 (*unnorm_dim)[2] = (const u32 (*)[2])mc.dim;
     const u32 unnorm_mask = mc.unnorm;
-    u8 shadow_func[16];
-    memcpy(shadow_func, mc.func, sizeof shadow_func);
+    const u8* shadow_func = mc.func;
     const u32 shadow_mask = mc.shadow;
     const u32 biased_mask = mc.biased;
     const u64 gamma_mask = mc.gamma;
     const int dyn_tex = eng_dyn_tex();
     s_tm_unnorm = unnorm_mask; s_tm_biased = biased_mask; s_tm_gamma = gamma_mask; s_tm_cube = cube_mask;
-    memcpy(s_tm_dim, unnorm_dim, sizeof s_tm_dim);
     /* SET_SHADER_PACKER (0x1FEC) bit 0: colour outputs are written as sRGB
      * (the RSX's sRGB-write, libgcm's fragment program gamma). A Crack in
      * Time sets it for its colour passes and clears it for the G-buffer, and
@@ -2614,7 +2686,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         } else {
             if (unnorm_mask) {
                 key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
-                key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
+                key = eng_fnv1a(unnorm_dim, sizeof mc.dim, key);
             }
             if (biased_mask) key = eng_fnv1a(&biased_mask, sizeof biased_mask, key ^ 0xB1A5ull);
             if (gamma_mask) key = eng_fnv1a(&gamma_mask, sizeof gamma_mask, key ^ 0x6A33ull);
@@ -2622,7 +2694,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (srgb_out) key = eng_fnv1a(&srgb_out, sizeof srgb_out, key ^ 0x5267ull);
         if (shadow_mask) {
             key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
-            key = eng_fnv1a(shadow_func, sizeof shadow_func, key);
+            key = eng_fnv1a(shadow_func, sizeof mc.func, key);
         }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
@@ -2666,7 +2738,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_fp_gamma_mask = dyn_tex ? 0u : gamma_mask;
         rsx_fp_dynamic_tex = dyn_tex;
         rsx_fp_srgb_out = srgb_out;
-        memcpy(rsx_fp_shadow_func, shadow_func, sizeof shadow_func);
+        memcpy(rsx_fp_shadow_func, shadow_func, sizeof mc.func);
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         rsx_fp_shadow_mask = 0;
@@ -3138,7 +3210,7 @@ static u32 eng_geom_ranges(u8* rloc, u32* roff, u32* rlen)
         const rsx_vertex_fetch_attr* f = &fp->attr[dc.layout.attrs[slot]];
         if (!f->desc.type || !f->desc.size) continue;       /* constant default */
         if (!f->stable_base) return 0;
-        const u64 off = (u64)fp->base_offset + f->desc.offset + (u64)f->stable_first * f->stride;
+        const u64 off = (u64)rsx_dsp_resolve_vertex_offset(fp->base_offset, f->desc.offset) + (u64)f->stable_first * f->stride;
         const u64 len = (u64)(f->stable_last - f->stable_first) * f->stride + f->elem_size;
         if (off + len > 0x100000000ull) return 0;
         u32 i = 0;
@@ -3375,7 +3447,7 @@ static u32 eng_vb_ranges(const rsx_vertex_layout_plan* layout, u32 a, u32 b,
         if (!d.type || !d.size) continue;
         const u32 esz = rsx_vertex_attrib_size(d.type, d.size);
         const u32 stride = d.stride;                 /* 0: every vertex reads the one element */
-        const u64 off = (u64)base + d.offset + (u64)a * stride;
+        const u64 off = (u64)rsx_dsp_resolve_vertex_offset(base, d.offset) + (u64)a * stride;
         const u64 len = (u64)(b - a) * stride + esz;
         if (!esz || off + len > 0x100000000ull) return 0;
         const u8* p = eng_guest_ptr(NULL, d.location, (u32)off, (u32)len);
@@ -3460,7 +3532,7 @@ static int eng_vb_get(const rsx_vertex_layout_plan* layout, u32 prim, u32 n_occ,
         if (e) {
             const u32 ulo = e->lo < a ? e->lo : a, uhi = e->hi > b ? e->hi : b;
             if (uhi - ulo < ENG_VB_MAX_SPAN) { lo = ulo; hi = uhi; }
-            if (e->lo <= a && b <= e->hi) s_vb_dirty++; else s_vb_grows++;
+            if (e->lo <= a && b <= e->hi) { s_vb_dirty++; g_rsx_vb_dirty++; } else s_vb_grows++;
         }
         if (hi - lo >= ENG_VB_MAX_SPAN) return -1;
         const u32 now = rsx_ww_epoch();
@@ -3488,7 +3560,7 @@ static int eng_vb_get(const rsx_vertex_layout_plan* layout, u32 prim, u32 n_occ,
         e->key = key; e->lo = lo; e->hi = hi; e->gpu = gpu; e->epoch = now; e->bytes = cls;
         if (eng_verify(4)) { e->cpu = (u8*)malloc(vbytes); if (e->cpu) memcpy(e->cpu, s_vb_verts, vbytes); }
         s_vb_held += cls;
-        s_vb_builds++; s_vb_conv_bytes += vbytes;
+        s_vb_builds++; g_rsx_vb_build++; s_vb_conv_bytes += vbytes;
     }
     e->frame = g.frames;
 
@@ -3567,6 +3639,7 @@ static int eng_geom_get(const rsx_vertex_layout_plan* layout, u32 prim, int rebu
 
 geom_miss:
     s_geom_misses++;
+    g_rsx_gmiss++;
     { const u64 n_ = eng_rdtsc(); s_gstage[2] += n_ - _gt; _gt = n_; }
     u64 _vt = eng_rdtsc();
     #define VBST(i) do { const u64 n_ = eng_rdtsc(); s_vbst[i] += n_ - _vt; _vt = n_; } while (0)
@@ -3583,8 +3656,12 @@ geom_miss:
          * reads no index at all); everything before that is a block draw. */
         const u64 content = (e && nr) ? eng_geom_content(nr, rloc, roff, rlen) : 0;
         const int promote = e && e->state == 1 && content && e->content == content;
+        static u32 s_prom_frame = ~0u, s_prom_left = 0;
+        if (s_prom_frame != g.frames) { s_prom_frame = g.frames; s_prom_left = 24u; }
+        const int do_promote = promote && s_prom_left > 0;
+        if (do_promote) s_prom_left--;
         VBST(2);
-        const int r = (n_occ && !promote) ? eng_vb_get(layout, prim, n_occ, a, b, o) : -1;
+        const int r = (n_occ && !do_promote) ? eng_vb_get(layout, prim, n_occ, a, b, o) : -1;
         VBST(3);
         if (r >= 0) {
             s_gstage[3] += eng_rdtsc() - _gt;
@@ -3626,7 +3703,7 @@ geom_miss:
      * second sighting and stored on its third. */
     const u64 content = (e && nr) ? eng_geom_content(nr, rloc, roff, rlen) : 0;
     if (!nr || (e && !content)) { s_geom_miss_nocontent++; return 0; }
-    if (!e) s_geom_miss_new++; else if (e->content != content) s_geom_miss_changed++; else s_geom_miss_promote++;
+    if (!e) s_geom_miss_new++; else if (e->content != content) s_geom_miss_changed++; else { s_geom_miss_promote++; g_rsx_geom_prom++; }
 
     if (!e) {                                   /* first sighting: remember it */
         e = &set[0];
@@ -3782,7 +3859,7 @@ static void eng_stage_report(void);
 static void eng_stats_report(void)
 {
     static int on = -1;
-    if (on < 0) on = getenv("RSX_ENG_STATS") ? 1 : 0;
+    if (on < 0) { const char* e = getenv("RSX_ENG_STATS"); on = (e && *e && *e != '0') ? 1 : 0; }
     if (!on) return;
     static const char* name[10] = { "needs-expansion", "bad-topology", "no-verts", "fetch-failed",
                                     "topology-rebuild", "zero-count", "no-target", "no-pipeline", "submitted",
@@ -4396,9 +4473,9 @@ static void eng_stage_report(void)
                       g.zdepths[i].offset, g.zdepths[i].w, g.zdepths[i].h, g.zdepths[i].used_w, g.zdepths[i].used_h,
                       g.zdepths[i].had_write, 10);
           for (u32 i = 0; i < g.n_surfaces; i++)
-              fprintf(stderr, "[eng-list] s%u %u:0x%08X %ux%u fmt %d age %u written %u%c", i, g.surfaces[i].location,
+              fprintf(stderr, "[eng-list] s%u %u:0x%08X %ux%u fmt %d age %llu written %u%c", i, g.surfaces[i].location,
                       g.surfaces[i].offset, g.surfaces[i].w, g.surfaces[i].h, (int)g.surfaces[i].fmt,
-                      g.surf_serial - g.surfaces[i].last_use, g.surfaces[i].color_written, 10);
+                      (unsigned long long)(g.surf_serial - g.surfaces[i].last_use), g.surfaces[i].color_written, 10);
       } }
     s_tex_lookups = s_tex_probe = s_tex_hashes = s_tex_hash_bytes = s_tex_hash_cyc = s_tex_ups = s_tex_up_cyc = 0;
     s_sink_calls = 0;
@@ -4422,7 +4499,20 @@ static int eng_draw_diag(void)
     return on;
 }
 
+unsigned long long g_rsx_eng_draw_us = 0;
+unsigned long long g_rsx_sweep_us = 0;
+unsigned long long g_rsx_ed_tex_us = 0, g_rsx_ed_pipe_us = 0, g_rsx_ed_const_us = 0, g_rsx_ed_draw_us = 0;
+unsigned long long g_rsx_dsnap_us = 0, g_rsx_zflush_us = 0;
+static void sink_end_inner(void* user, const rsx_dispatch* r);
 static void sink_end(void* user, const rsx_dispatch* r)
+{
+    extern unsigned long long ps3_qpc_us(void);
+    const unsigned long long t0 = ps3_qpc_us();
+    g_rsx_draws++;
+    sink_end_inner(user, r);
+    g_rsx_eng_draw_us += ps3_qpc_us() - t0;
+}
+static void sink_end_inner(void* user, const rsx_dispatch* r)
 {
     u64 _st = eng_tsc();
     const u64 hf0_ = eng_hf_tsc();
@@ -4459,7 +4549,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_vertex_layout_plan layout;
     { const u64 t_ = eng_rdtsc(); eng_vertex_layout(&layout); s_gstage[0] += eng_rdtsc() - t_; }
     eng_geom geo;
-    { const int why = eng_geom_get(&layout, prim, rebuild, &geo);
+    { extern unsigned long long ps3_qpc_us(void);
+      const unsigned long long ft0 = ps3_qpc_us();
+      const int why = eng_geom_get(&layout, prim, rebuild, &geo);
+      g_rsx_gfetch_us += ps3_qpc_us() - ft0;
       STAGE(0);
       if (why) { ENG_DROP(why); return; } }
     const int indexed = geo.indices != NULL || geo.gpu_indexed;
@@ -4525,6 +4618,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
     STAGE(1);
+    extern unsigned long long ps3_qpc_us(void);
+    const unsigned long long ed_t0 = ps3_qpc_us();
     static int s_all_units = -1;     /* RSX_ENG_ALL_UNITS=1: resolve every enabled unit, as before */
     if (s_all_units < 0) { const char* e = getenv("RSX_ENG_ALL_UNITS"); s_all_units = e && *e == '1'; }
     const u32 fp_mask_ = s_all_units ? 0xFFFFu : eng_fp_tex_mask();
@@ -4548,6 +4643,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 vtex_mask = sink_bind_vertex_textures(vm_mask, vtextures,
                                                     vsamplers);
     s_tsub[3] += eng_rdtsc() - _tv;
+    const unsigned long long ed_t1 = ps3_qpc_us();
+    g_rsx_ed_tex_us += ed_t1 - ed_t0;
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -4558,6 +4655,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed);
+    const unsigned long long ed_t2 = ps3_qpc_us();
+    g_rsx_ed_pipe_us += ed_t2 - ed_t1;
     STAGE(3);
     u64 _ct = _st;
     if (!pipeline) { ENG_DROP(7); return; }
@@ -4721,7 +4820,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
                   const u32 ai = layout.attrs[sl];
                   rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, ai, &va);
                   const u8* rb = va.type ? eng_guest_ptr(NULL, va.location,
-                      rsx_dsp_vertex_data_base_offset(&g.rsx) + va.offset, 8) : NULL;
+                      rsx_dsp_resolve_vertex_offset(rsx_dsp_vertex_data_base_offset(&g.rsx), va.offset), 8) : NULL;
                   fprintf(stderr, "[rsx trace]     v0 attr%u = %g %g %g %g  raw %02X %02X %02X %02X %02X %02X %02X %02X%c", ai,
                           fv[0], fv[1], fv[2], fv[3], rb ? rb[0] : 0, rb ? rb[1] : 0, rb ? rb[2] : 0, rb ? rb[3] : 0,
                           rb ? rb[4] : 0, rb ? rb[5] : 0, rb ? rb[6] : 0, rb ? rb[7] : 0, 10);
@@ -4794,9 +4893,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
-    memset(g.fp_cb, 0, fp_bytes);
-    if (g.fp_constants.count)
-        memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+    if (!g.fp_constants.count) memset(g.fp_cb, 0, 16u);
+    else memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       /* WPOS in guest pixels (rsx_fp_decompiler input_expr): the backend's
@@ -4853,8 +4951,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) { handles[i] = g.surfaces[targets[i]].handle;
                                           if (rs.color_mask) g.surfaces[targets[i]].srgb_written = (u8)s_srgb_draw; }
-    g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
-    g.be->bind_pipeline(g.be->user, pipeline);
+    static u32 s_lb_handles[RSX_BE_MAX_COLOR_TARGETS], s_lb_n, s_lb_depth, s_lb_pipe, s_lb_vtex;
+    static int s_lb_valid;
+    if (!s_lb_valid || s_lb_n != n_targets || s_lb_depth != depth_handle ||
+        memcmp(s_lb_handles, handles, n_targets * sizeof(u32)) != 0) {
+        g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
+        memcpy(s_lb_handles, handles, n_targets * sizeof(u32));
+        s_lb_n = n_targets; s_lb_depth = depth_handle;
+    }
+    if (!s_lb_valid || s_lb_pipe != pipeline) {
+        g.be->bind_pipeline(g.be->user, pipeline);
+        s_lb_pipe = pipeline;
+    }
+    s_lb_valid = 1;
     BSUB(0);
     /* The 7.5 KB block only when it changed: the backend keeps what it was
      * last given, and binding it unchanged copied it twice per draw. */
@@ -4880,9 +4989,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
     BSUB(2);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
-    g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+    if (vtex_mask || s_lb_vtex) {
+        g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+        s_lb_vtex = vtex_mask;
+    }
     BSUB(3);
-    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W * (float)aas, H * (float)aas);
+    {
+        static float s_lb_vw, s_lb_vh;
+        const float vw = W * (float)aas, vh = H * (float)aas;
+        if (vw != s_lb_vw || vh != s_lb_vh) {
+            g.be->set_viewport(g.be->user, 0.0f, 0.0f, vw, vh);
+            s_lb_vw = vw; s_lb_vh = vh;
+        }
+    }
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
      * full 4096x4096 window and a never-written register reads 0 here, which
@@ -4922,8 +5041,26 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (g.be->set_blend_color && rs.blend_enable &&
         (((rs.sf_rgb | rs.df_rgb | rs.sf_a | rs.df_a) & 0x8000u) != 0u)) {
         const u32 bc = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR);
-        const float rgba[4] = { (float)((bc >> 16) & 0xFFu) / 255.0f, (float)((bc >> 8) & 0xFFu) / 255.0f,
-                                (float)(bc & 0xFFu) / 255.0f, (float)(bc >> 24) / 255.0f };
+        float rgba[4];
+        if (rs.rt_fp16) {
+            const u32 bc2 = rsx_dsp_reg(&g.rsx, 0x0300u);
+            const u16 h[4] = { (u16)bc, (u16)(bc >> 16), (u16)bc2, (u16)(bc2 >> 16) };
+            for (int k = 0; k < 4; k++) {
+                const u32 e = (h[k] >> 10) & 0x1Fu, m = h[k] & 0x3FFu;
+                float v = e == 0 ? m / 16777216.0f : (e == 31 ? 65504.0f : ldexpf(1.0f + m / 1024.0f, (int)e - 15));
+                rgba[k] = (h[k] & 0x8000u) ? -v : v;
+            }
+        } else {
+            rgba[0] = (float)((bc >> 16) & 0xFFu) / 255.0f;
+            rgba[1] = (float)((bc >>  8) & 0xFFu) / 255.0f;
+            rgba[2] = (float)( bc        & 0xFFu) / 255.0f;
+            rgba[3] = (float)((bc >> 24) & 0xFFu) / 255.0f;
+        }
+        const int ca = rs.sf_rgb == 0x8003u || rs.sf_rgb == 0x8004u ||
+                       rs.df_rgb == 0x8003u || rs.df_rgb == 0x8004u;
+        const int cc = rs.sf_rgb == 0x8001u || rs.sf_rgb == 0x8002u ||
+                       rs.df_rgb == 0x8001u || rs.df_rgb == 0x8002u;
+        if (ca && !cc) rgba[0] = rgba[1] = rgba[2] = rgba[3];
         g.be->set_blend_color(g.be->user, rgba);
         { static u32 seen[24][3]; static u32 n_seen;   /* each use once, for the logs */
           const u32 fa = (rs.sf_rgb << 16) | rs.df_rgb, fb = (rs.sf_a << 16) | rs.df_a;
@@ -4939,40 +5076,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     CSTAGE(3);
 
     STAGE(4);
-    {
-        const u32 cur_tgt_off = g.surfaces[target].offset;
-        if (cur_tgt_off == 0x00000000u || cur_tgt_off == 0x00398000u) {
-            static u32 s_disp_log_cnt = 0;
-            if (s_disp_log_cnt < 40 || (g.frames % 60 == 0)) {
-                s_disp_log_cnt++;
-                fprintf(stderr, "[disp-draw] f=%u tgt=%u:0x%08X %ux%u pipe=%016llx topo=%u n_draw=%u stride=%u idx=%d (cmask=0x%X dtest=%u dwrite=%u dfunc=0x%X blend=%u sf=0x%X df=0x%X zslot=%u:0x%08X)\n",
-                        g.frames, g.surfaces[target].location, cur_tgt_off,
-                        g.surfaces[target].w, g.surfaces[target].h,
-                        (unsigned long long)s_last_pipe_key,
-                        (unsigned)topology, n_draw, layout.stride, indexed,
-                        rs.color_mask, rs.depth_test, rs.depth_write, rs.depth_func,
-                        rs.blend_enable, rs.sf_rgb, rs.df_rgb,
-                        zslot != ENG_INVALID ? g.zdepths[zslot].location : 99,
-                        zslot != ENG_INVALID ? g.zdepths[zslot].offset : 0);
-                for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-                    if (!(tex_mask & (1u << u))) continue;
-                    rsx_dsp_texture tt; rsx_dsp_get_texture(&g.rsx, u, &tt);
-                    fprintf(stderr, "   tex[%u]: %u:0x%08X %ux%u fmt=0x%02X wrap=0x%X remap=0x%X src=<%s>\n",
-                            u, tt.location, tt.offset, tt.width, tt.height, tt.format, tt.wrap, tt.remap,
-                            s_tex_src[u] ? s_tex_src[u] : "?");
-                }
-                if (geo.verts && layout.stride >= 16) {
-                    const float* vf = (const float*)geo.verts;
-                    fprintf(stderr, "   v0: %g %g %g %g | v1: %g %g %g %g\n",
-                            vf[0], vf[1], vf[2], vf[3],
-                            geo.n_upload > 1 ? ((const float*)(geo.verts + layout.stride))[0] : 0.0f,
-                            geo.n_upload > 1 ? ((const float*)(geo.verts + layout.stride))[1] : 0.0f,
-                            geo.n_upload > 1 ? ((const float*)(geo.verts + layout.stride))[2] : 0.0f,
-                            geo.n_upload > 1 ? ((const float*)(geo.verts + layout.stride))[3] : 0.0f);
-                }
-            }
-        }
-    }
+    const unsigned long long ed_t3 = ps3_qpc_us();
+    g_rsx_ed_const_us += ed_t3 - ed_t2;
     g.surfaces[target].draws_since_present++;
     g.surfaces[target].last_clip = (sf.clip_w << 16) | sf.clip_h;
     if (geo.vb)
@@ -4982,6 +5087,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     else
         g.be->draw(g.be->user, topology, geo.verts, geo.n_upload, layout.stride,
                    geo.indices, indexed ? n_draw : 0);
+    g_rsx_ed_draw_us += ps3_qpc_us() - ed_t3;
     STAGE(5);
     s_hf.draws++; s_hf.sink_cyc += eng_hf_tsc() - hf0_;
     if (__builtin_expect(eng_draw_diag(), 0)) {   /* the per-draw diagnostics below, all off unless asked for */
@@ -5264,6 +5370,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         g.zdepths[zslot].ww_epoch = rsx_ww_epoch();
         /* Later readers must see this pass, not a copy taken before it. */
         g.zdepths[zslot].snapshot_valid = 0;
+        g.zdepths[zslot].snapshot_spare_valid = 0;
         g.zdepths[zslot].as_color_valid = 0;
     }
     if (rs.color_mask)
@@ -5287,14 +5394,8 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     if (!g.ready) return;
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    { static int cl = -1; if (cl < 0) cl = getenv("RSX_ENG_CLEAR_LOG") ? 1 : 0;
-      if (cl && s_clearlog_from != ~0u && g.frames >= s_clearlog_from && g.frames < s_clearlog_from + 2u) {
-          rsx_dsp_surface sf_; rsx_dsp_get_surface(&g.rsx, &sf_);
-          fprintf(stderr, "[clear] frame %u mask %X colour %08X zs %08X tgt %08X (%u targets, %ux%u) zeta %u:%08X clip %ux%u%c",
-                  g.frames, mask, rsx_dsp_clear_color(&g.rsx), rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR),
-                  n_targets ? g.surfaces[targets[0]].offset : 0u, n_targets,
-                  n_targets ? g.surfaces[targets[0]].w : 0u, n_targets ? g.surfaces[targets[0]].h : 0u,
-                  sf_.zeta_location, sf_.zeta_offset, sf_.clip_w, sf_.clip_h, 10); } }
+    (void)n_targets;
+    (void)targets;
     if (!n_targets) return;
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
@@ -5362,6 +5463,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             g.zdepths[zslot].last_write = ++g.surf_serial;
             g.zdepths[zslot].ww_epoch = rsx_ww_epoch();
             g.zdepths[zslot].snapshot_valid = 0;
+            g.zdepths[zslot].snapshot_spare_valid = 0;
             g.zdepths[zslot].as_color_valid = 0;
         }
     }
@@ -5479,26 +5581,28 @@ static void eng_dump_all_surfaces(u32 frame)
  * scene's draws having executed (rsx_live_draw.c:7557-7570). */
 static u32 eng_present_surface(u32 buffer_id)
 {
-    /* If no new draws occurred since the last present call, show the last frame again
-     * to prevent double-flip flicker */
+    /* Anti-flicker: if no new draws since the last present, hold the last frame.
+     * This is the original proven fix that eliminates double-flip flicker. */
     if (g.surf_serial == s_frame_serial && g.last_present_surface < g.n_surfaces &&
         g.surfaces[g.last_present_surface].handle) {
         return g.last_present_surface;
     }
 
+    /* RSX_PRESENT_MODE env (read once) and F5 key both set s_surface_override. */
     static int s_env_checked = 0;
     if (!s_env_checked) {
         s_env_checked = 1;
         const char* m = getenv("RSX_PRESENT_MODE");
         if (m) {
-            if (!_stricmp(m, "disp")) s_surface_override = 0;
+            if (!_stricmp(m, "disp"))       s_surface_override = 0;
             else if (!_stricmp(m, "scene")) s_surface_override = 1;
-            else if (!_stricmp(m, "ui")) s_surface_override = 2;
-            else if (!_stricmp(m, "ram")) s_surface_override = 3;
-            else s_surface_override = -1;
+            else if (!_stricmp(m, "ui"))    s_surface_override = 2;
+            else if (!_stricmp(m, "ram"))   s_surface_override = 3;
+            else                            s_surface_override = -1;
         }
     }
 
+    /* Lazily register the requested display buffer if GCM knows about it. */
     if (buffer_id < 8 && !g.display_buffers[buffer_id].valid) {
         extern int cellGcm_display_buffer_info(u32, u32*, u32*, u32*, u32*);
         u32 off, pitch, w, h;
@@ -5506,89 +5610,55 @@ static u32 eng_present_surface(u32 buffer_id)
             rsx_draw_engine_set_display_buffer(buffer_id, 0, off, pitch, w, h);
     }
 
+    /* Find the registered display-flip surface. */
     u32 disp_surf = ENG_INVALID;
     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
         const eng_display_buffer* d = &g.display_buffers[buffer_id];
         disp_surf = eng_surface_find(d->location, d->offset, d->width, d->height);
     }
 
-    /* 3D scene target in Ratchet & Clank: Into the Nexus is at local offset 0x00880000 (1280x720) */
+    /* Find the well-known 3D scene surface at 0x00880000 (1280x720 local). */
     u32 scene_surf = ENG_INVALID;
-    u32 ui_surf = ENG_INVALID;
-    u32 ram_surf = ENG_INVALID;
     for (u32 i = 0; i < g.n_surfaces; i++) {
-        if (!g.surfaces[i].handle || g.surfaces[i].w != 1280u || g.surfaces[i].h != 720u) continue;
-        if (g.surfaces[i].location == 0 && g.surfaces[i].offset == 0x00880000u) scene_surf = i;
-        else if (g.surfaces[i].location == 0 && g.surfaces[i].offset == 0x013C0000u) ui_surf = i;
-        else if (g.surfaces[i].location == 1 && g.surfaces[i].offset == 0x00030000u) ram_surf = i;
+        if (g.surfaces[i].handle && g.surfaces[i].offset == 0x00880000u &&
+            g.surfaces[i].w == 1280u && g.surfaces[i].h == 720u) {
+            scene_surf = i;
+            break;
+        }
     }
 
-    u32 chosen = ENG_INVALID;
+    /* Manual override via F5 / RSX_PRESENT_MODE. */
+    if (s_surface_override >= 0) {
+        u32 ram_surf = ENG_INVALID, ui_surf = ENG_INVALID;
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (!g.surfaces[i].handle || g.surfaces[i].w != 1280u || g.surfaces[i].h != 720u) continue;
+            if (g.surfaces[i].location == 0 && g.surfaces[i].offset == 0x013C0000u) ui_surf  = i;
+            if (g.surfaces[i].location == 1 && g.surfaces[i].offset == 0x00030000u) ram_surf = i;
+        }
+        if (s_surface_override == 0 && disp_surf  != ENG_INVALID && g.surfaces[disp_surf ].handle) return disp_surf;
+        if (s_surface_override == 1 && scene_surf != ENG_INVALID && g.surfaces[scene_surf].handle) return scene_surf;
+        if (s_surface_override == 2 && ui_surf    != ENG_INVALID && g.surfaces[ui_surf   ].handle) return ui_surf;
+        if (s_surface_override == 3 && ram_surf   != ENG_INVALID && g.surfaces[ram_surf  ].handle) return ram_surf;
+    }
 
-    // Check manual override (via F5 or RSX_PRESENT_MODE)
-    if (s_surface_override == 0 && disp_surf != ENG_INVALID && g.surfaces[disp_surf].handle)
-        chosen = disp_surf;
-    else if (s_surface_override == 1 && scene_surf != ENG_INVALID && g.surfaces[scene_surf].handle)
-        chosen = scene_surf;
-    else if (s_surface_override == 2 && ui_surf != ENG_INVALID && g.surfaces[ui_surf].handle)
-        chosen = ui_surf;
-    else if (s_surface_override == 3 && ram_surf != ENG_INVALID && g.surfaces[ram_surf].handle)
-        chosen = ram_surf;
-
-    if (chosen == ENG_INVALID) {
-        // Auto presentation mode:
-        // 1. Registered display buffer if it received any draws recently
-        if (disp_surf != ENG_INVALID && g.surfaces[disp_surf].handle &&
-            (g.surf_serial - g.surfaces[disp_surf].last_write) < 100) {
-            chosen = disp_surf;
-        }
-        // 2. 3D Scene target (0x00880000) if recently drawn
-        else if (scene_surf != ENG_INVALID && g.surfaces[scene_surf].handle &&
-                 (g.surf_serial - g.surfaces[scene_surf].last_write) < 100) {
-            chosen = scene_surf;
-        }
-        // 3. UI/Composite target (0x013C0000) if recently drawn
-        else if (ui_surf != ENG_INVALID && g.surfaces[ui_surf].handle &&
-                 (g.surf_serial - g.surfaces[ui_surf].last_write) < 100) {
-            chosen = ui_surf;
-        }
-        // 4. Latest written 1280x720 surface
-        else {
-            u64 best_write = 0;
-            for (u32 i = 0; i < g.n_surfaces; i++) {
-                if (g.surfaces[i].handle && g.surfaces[i].w == 1280u && g.surfaces[i].h == 720u) {
-                    if (g.surfaces[i].last_write > best_write) {
-                        best_write = g.surfaces[i].last_write;
-                        chosen = i;
-                    }
-                }
+    /* Auto presentation: present the registered display buffer for buffer_id
+     * rather than hijacking it with an offscreen scene target (0x00880000),
+     * so 2D menus, HUD, and post-processed composites reach the screen. */
+    if (disp_surf == ENG_INVALID && buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+        const eng_display_buffer* d = &g.display_buffers[buffer_id];
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+                g.surfaces[i].offset == d->offset) {
+                disp_surf = i;
+                break;
             }
         }
     }
-
-    if (chosen == ENG_INVALID) {
-        if (disp_surf != ENG_INVALID && g.surfaces[disp_surf].handle) chosen = disp_surf;
-        else if (scene_surf != ENG_INVALID && g.surfaces[scene_surf].handle) chosen = scene_surf;
-        else if (g.last_present_surface < g.n_surfaces && g.surfaces[g.last_present_surface].handle) chosen = g.last_present_surface;
-        else chosen = eng_current_surface();
-    }
-
-    static u32 s_last_log_frame = 0;
-    if (g.frames % 120 == 0 && g.frames != s_last_log_frame) {
-        s_last_log_frame = g.frames;
-        fprintf(stderr, "[rsx present-choice] frame=%u req_buf=%u disp=%u(off=%08X, age=%llu) scene=%u(off=%08X, age=%llu) ui=%u(off=%08X, age=%llu) -> chosen=%u(off=%08X) [override=%d]\n",
-                g.frames, buffer_id,
-                disp_surf, disp_surf != ENG_INVALID ? g.surfaces[disp_surf].offset : 0,
-                disp_surf != ENG_INVALID ? (unsigned long long)(g.surf_serial - g.surfaces[disp_surf].last_write) : 999999ull,
-                scene_surf, scene_surf != ENG_INVALID ? g.surfaces[scene_surf].offset : 0,
-                scene_surf != ENG_INVALID ? (unsigned long long)(g.surf_serial - g.surfaces[scene_surf].last_write) : 999999ull,
-                ui_surf, ui_surf != ENG_INVALID ? g.surfaces[ui_surf].offset : 0,
-                ui_surf != ENG_INVALID ? (unsigned long long)(g.surf_serial - g.surfaces[ui_surf].last_write) : 999999ull,
-                chosen, chosen != ENG_INVALID ? g.surfaces[chosen].offset : 0,
-                s_surface_override);
-    }
-
-    return chosen;
+    if (disp_surf != ENG_INVALID && g.surfaces[disp_surf].handle)
+        return disp_surf;
+    if (g.last_present_surface < g.n_surfaces && g.surfaces[g.last_present_surface].handle)
+        return g.last_present_surface;
+    return eng_current_surface();
 }
 
 static void eng_writeback_small(void)
@@ -5879,8 +5949,20 @@ static void eng_budget_enforce(void)
          * at 2.0x, so a fight's targets are not evicted (and written back,
          * a GPU wait each) all the time, and VRAM stays near 4 GB. */
         { const double sc = g_rsx_res_scale > 1.0f ? g_rsx_res_scale : 1.0;
-          rt_budget = (u64)((double)eng_env_mb("RSX_ENG_RT_MB", 768) * sc);
-          z_budget = (u64)((double)eng_env_mb("RSX_ENG_Z_MB", 768) * sc); }
+          u64 rt_mb = (u64)(768.0 * sc);
+          u64 z_mb  = (u64)(768.0 * sc);
+          if (g_rsx_vram_budget_mb) {
+              /* Keep tex_budget + 2*rt_budget + 2*z_budget <= 80% of card VRAM
+               * so hard-limit eviction triggers well before vkAllocateMemory fails. */
+              const u64 tex_mb = tex_budget >> 20;
+              const u64 safe_mb = (u64)g_rsx_vram_budget_mb * 80u / 100u;
+              const u64 avail_mb = safe_mb > tex_mb + 256u ? safe_mb - tex_mb : 256u;
+              const u64 max_each = avail_mb / 4u;
+              if (rt_mb > max_each) rt_mb = max_each;
+              if (z_mb  > max_each) z_mb  = max_each;
+          }
+          rt_budget = eng_env_mb("RSX_ENG_RT_MB", rt_mb);
+          z_budget  = eng_env_mb("RSX_ENG_Z_MB", z_mb); }
         { const char* e = getenv("RSX_ENG_TEX_MAX"); const long v = e ? atol(e) : 0;
           tex_max = v > 0 && v <= ENG_MAX_TEXTURES ? (u32)v : ENG_MAX_TEXTURES / 8u * 7u; }
         memlog = getenv("RSX_ENG_MEMLOG") ? 1 : 0;
@@ -6074,21 +6156,24 @@ static void eng_present(u32 buffer_id)
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
 
-    if (s_dump_requested || g.frames == 60 || g.frames == 120 || g.frames == 300 || g.frames == 600 ||
-        g.frames == 900 || g.frames == 1200 || g.frames == 1800 || g.frames == 2400 || g.frames == 3600) {
+    if (s_dump_requested || (getenv("RSX_DUMP") && (g.frames == 60 || g.frames == 120 || g.frames == 300 || g.frames == 600 ||
+        g.frames == 900 || g.frames == 1200 || g.frames == 1800 || g.frames == 2400 ||
+        g.frames == 3000 || g.frames == 3120 || g.frames == 3240 || g.frames == 3360 || g.frames == 3600))) {
         s_dump_requested = 0;
         eng_dump_all_surfaces(g.frames);
     }
-    if (g.frames % 120 == 0) {
-        u32 current = eng_current_surface();
-        fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
-                g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);
-        for (u32 i = 0; i < g.n_surfaces; ++i)
-            fprintf(stderr, "[rsx capture]   surf %u loc=%u offset=%08X size=%ux%u draws=%u last_write=%llu handle=%u\n",
-                    i, g.surfaces[i].location, g.surfaces[i].offset,
-                    g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].draws_since_present,
-                    (unsigned long long)g.surfaces[i].last_write, g.surfaces[i].handle);
-    }
+    { static int cap_log = -1;
+      if (cap_log < 0) { const char* e = getenv("RSX_ENG_CAPTURE_LOG"); cap_log = (e && *e == '1') ? 1 : 0; }
+      if (cap_log && g.frames % 120 == 0) {
+          u32 current = eng_current_surface();
+          fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
+                  g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);
+          for (u32 i = 0; i < g.n_surfaces; ++i)
+              fprintf(stderr, "[rsx capture]   surf %u loc=%u offset=%08X size=%ux%u draws=%u last_write=%llu handle=%u\n",
+                      i, g.surfaces[i].location, g.surfaces[i].offset,
+                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].draws_since_present,
+                      (unsigned long long)g.surfaces[i].last_write, g.surfaces[i].handle);
+      } }
     /* RSX_ENG_PRESENT_LOG=<n>: log present info */
     { static long n_log = -1; static long seen = 0;
       if (n_log < 0) { const char* e = getenv("RSX_ENG_PRESENT_LOG"); n_log = e ? atol(e) : 0; }
@@ -6110,7 +6195,7 @@ static void eng_present(u32 buffer_id)
     s_frame_serial = g.surf_serial;
     if (g.frames % 120 == 0) eng_stats_report();
     { static int tt = -1;
-      if (tt < 0) { const char* e = getenv("RSX_ENG_TRACE_TARGETS"); tt = e ? atol(e) : 1; }
+      if (tt < 0) { const char* e = getenv("RSX_ENG_TRACE_TARGETS"); tt = e ? atol(e) : 0; }
       if (tt && g.frames % 120 < 2 && s_tt_n) {   /* a flip presents twice; the second has no draws */
           fprintf(stderr, "[rsx targets] frame %u, in first-use order:\n", g.frames);
           for (u32 i = 0; i < s_tt_n; i++) {
@@ -6126,6 +6211,7 @@ static void eng_present(u32 buffer_id)
     { const unsigned long long bt0 = ps3_qpc_us();
       eng_budget_enforce();
       const unsigned long long bt1 = ps3_qpc_us();
+      g_rsx_sweep_us += bt1 - bt0;
       if (bt1 - bt0 >= 20000ull) { static int n; if (n++ < 100)
           fprintf(stderr, "[present-slow] frame %u: memory budget enforcement %.1f ms%c", g.frames, (bt1 - bt0) / 1e3, 10); } }
     g.last_guest_draws = g.guest_draws;
@@ -6136,7 +6222,16 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    g.sink_flips++;
     eng_present(g.last_flip_buffer);
+}
+
+static int eng_host_present_allowed(void)
+{
+    if (!g.sink_flips) return 1;
+    static int said = 0;
+    if (!said++) fprintf(stderr, "[rsx engine] host presents ignored from now on: this title flips through its FIFO\n");
+    return 0;
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -6239,6 +6334,8 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    if (m == 0x17C8u) { extern void rsx_be_zpass_set_enable(u32); rsx_be_zpass_set_enable(arg); }
+    else if (m == 0x17CCu) { extern void rsx_be_zpass_clear(u32); rsx_be_zpass_clear(arg); }
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
@@ -6256,7 +6353,10 @@ void rsx_draw_engine_methods(u32 method, const u8* be, u32 count, int incrementi
             continue;
         }
         u32 w; memcpy(&w, be + (size_t)i * 4u, 4);
-        rsx_dispatch_method(&g.rsx, m, __builtin_bswap32(w));
+        const u32 arg = __builtin_bswap32(w);
+        if (m == 0x17C8u) { extern void rsx_be_zpass_set_enable(u32); rsx_be_zpass_set_enable(arg); }
+        else if (m == 0x17CCu) { extern void rsx_be_zpass_clear(u32); rsx_be_zpass_clear(arg); }
+        rsx_dispatch_method(&g.rsx, m, arg);
         i++;
     }
 }
@@ -6292,6 +6392,7 @@ void rsx_draw_engine_present(void)
      * without it this presented "buffer 0", which A Crack in Time never
      * registers (it uses 1 and 2), so every present fell back to whatever
      * target was bound last -- some frames showed an intermediate buffer. */
+    if (!eng_host_present_allowed()) return;
     extern u32 cellGcmGetCurrentDisplayBufferId(void);
     const u32 id = cellGcmGetCurrentDisplayBufferId();
     if (id < 8) g.last_flip_buffer = id;
@@ -6536,6 +6637,7 @@ int rsx_draw_engine_blit_pitched(u32 src_loc, u32 src_off, u32 src_pitch, u32 sx
                         (unsigned long long)g.zdepths[i].last_write, n, 10);
         }
         g.zdepths[zd].snapshot_valid = 0;
+        g.zdepths[zd].snapshot_spare_valid = 0;
         g.zdepths[zd].as_color_valid = 0;
         return 1;
     }
@@ -6646,8 +6748,18 @@ int rsx_draw_engine_blit_pitched(u32 src_loc, u32 src_off, u32 src_pitch, u32 sx
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
+    if (!eng_host_present_allowed()) return;
     g.last_flip_buffer = buffer_id & 7u;
     eng_present(g.last_flip_buffer);
+}
+
+int rsx_draw_engine_fifo_flip(u32 buffer_id)
+{
+    if (!g.ready) return 0;
+    g.last_flip_buffer = buffer_id & 7u;
+    g.sink_flips++;
+    eng_present(g.last_flip_buffer);
+    return 1;
 }
 
 u32 rsx_draw_engine_guest_draws(void)

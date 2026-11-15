@@ -1,0 +1,29 @@
+Project Raccoon v0.3 — Third-Party Notices
+==========================================
+
+This release bundles or relies on the following open-source tools and libraries.
+No copyrighted game binaries, assets, or Sony/Insomniac code are included.
+
+1. Python (3.12 Embeddable)
+   License: Python Software Foundation License (PSF-2.0)
+   https://www.python.org/
+
+2. CMake
+   License: BSD-3-Clause License
+   https://cmake.org/
+
+3. Ninja
+   License: Apache License 2.0
+   https://ninja-build.org/
+
+4. Zig (ziglang)
+   License: MIT License
+   https://ziglang.org/
+
+5. SDL2
+   License: zlib License
+   https://www.libsdl.org/
+
+6. ps3recomp
+   PS3 PPU/SPU/RSX static recompilation runtime & tooling
+   https://github.com/sp00nznet/ps3recomp

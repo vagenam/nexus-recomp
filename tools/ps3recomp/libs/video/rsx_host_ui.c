@@ -43,6 +43,7 @@ static int   s_page;                  /* 0 General, 1 Graphics, 2 Controls */
  * (rsx_be_proxy.c); set from the options here. */
 extern volatile int g_racacit_spu_spin_us;
 extern volatile int g_racacit_present_pace;
+extern volatile int g_racacit_fps_limit;
 static int   s_last_full = RSX_UI_DISPLAY_BORDERLESS;   /* what F11 returns to */
 
 static volatile int s_open;          /* menu showing */
@@ -74,6 +75,8 @@ static unsigned s_ft_n;
 static unsigned long long s_last_present;
 static char  s_fps_text[64];
 static unsigned long long s_fps_next;
+static char  s_title_pending[128];
+static int   s_title_dirty;
 
 static unsigned long long now_ms(void) { return (unsigned long long)SDL_GetTicks64(); }
 
@@ -107,12 +110,23 @@ void rsx_host_ui_load_options(void)
     if (env_is("RACACIT_PRESENT_MODE", "immediate")) o.vsync = RSX_UI_VSYNC_IMMEDIATE;
     o.keep_aspect = !env_is("RACACIT_ASPECT", "stretch");
     o.upscale = RSX_UI_UPSCALE_BILINEAR;
-    o.sharpness  = 0;
-    o.brightness = 0;
-    o.res_scale = 1.0f;
-    o.aniso = 0;
-    o.trilinear = 0;
+    if (env_is("RACACIT_UPSCALE", "sharp"))   o.upscale = RSX_UI_UPSCALE_SHARP;
+    if (env_is("RACACIT_UPSCALE", "nearest")) o.upscale = RSX_UI_UPSCALE_NEAREST;
+    o.sharpness  = clampi(env_int("RACACIT_SHARPNESS", 0), 0, 10);
+    o.brightness = clampi(env_int("RACACIT_BRIGHTNESS", 0), -5, 5);
+    { const char* v = getenv("RACACIT_RES_SCALE");
+      float sc = (v && *v && SDL_strcasecmp(v, "auto")) ? (float)atof(v) : 1.0f;
+      if (!(sc >= 0.5f)) sc = 1.0f;
+      if (sc > 3.0f) sc = 3.0f;
+      o.res_scale = sc; }
+    o.shadow_res = clampi(env_int("RACACIT_SHADOW_RES", 2), 1, 4);
+    { int a = env_int("RACACIT_ANISO", 0);
+      o.aniso = (a >= 16) ? 16 : (a >= 8) ? 8 : (a >= 4) ? 4 : (a >= 2) ? 2 : 0; }
+    o.trilinear = env_int("RACACIT_TRILINEAR", 0) ? 1 : 0;
     o.fps = env_int("RACACIT_FPS", 0) ? 1 : 0;
+    { int fl = env_int("RACACIT_FPS_LIMIT", 0);
+      o.fps_limit = (fl == 30 || fl == 60 || fl == 120) ? fl : 0;
+      g_racacit_fps_limit = o.fps_limit; }
     o.discord = 0;
     o.skip_clank = 0;
     o.armor_look = 0;
@@ -130,7 +144,6 @@ void rsx_host_ui_load_options(void)
     fprintf(stderr, "[settings] DualSense Plus: %s%c", o.ds_plus ? "on (DualSense extras, Fire on R2)"
                                                     : "off (every controller a plain pad, PS3 layout)", 10);
     o.tex_quality   = 0;
-    o.cpu_mode      = env_int("RACACIT_CPU_MODE", 0);
     o.present_pace  = 0;
     o.kbm           = env_int("RACACIT_KBM", 1) ? 1 : 0;
     { const char* v = getenv("RACACIT_MOUSE_SENS"); const double m = v && *v ? atof(v) : 1.0;
@@ -139,7 +152,7 @@ void rsx_host_ui_load_options(void)
     o.fov           = 100;
     o.cam_dist      = 100;
     s_texq_active   = 0;
-    g_racacit_spu_spin_us = o.cpu_mode ? 200 : 30;
+    g_racacit_spu_spin_us = 30;
     g_racacit_present_pace = 0;
     o.gen = 1;
     if (o.display_mode != RSX_UI_DISPLAY_WINDOWED) s_last_full = o.display_mode;
@@ -194,7 +207,15 @@ static void settings_lines(const rsx_host_options* o, char kv[][96], int* n)
                                                    : o->vsync == RSX_UI_VSYNC_IMMEDIATE ? "immediate" : "mailbox");
     snprintf(kv[k++], 96, "RACACIT_ASPECT=%s", o->keep_aspect ? "keep" : "stretch");
     snprintf(kv[k++], 96, "RACACIT_FPS=%d", o->fps);
-    snprintf(kv[k++], 96, "RACACIT_CPU_MODE=%d", o->cpu_mode);
+    snprintf(kv[k++], 96, "RACACIT_FPS_LIMIT=%d", o->fps_limit);
+    snprintf(kv[k++], 96, "RACACIT_RES_SCALE=%.2f", (double)o->res_scale);
+    snprintf(kv[k++], 96, "RACACIT_SHADOW_RES=%d", o->shadow_res);
+    snprintf(kv[k++], 96, "RACACIT_UPSCALE=%s", o->upscale == RSX_UI_UPSCALE_SHARP ? "sharp"
+                                              : o->upscale == RSX_UI_UPSCALE_NEAREST ? "nearest" : "bilinear");
+    snprintf(kv[k++], 96, "RACACIT_SHARPNESS=%d", o->sharpness);
+    snprintf(kv[k++], 96, "RACACIT_ANISO=%d", o->aniso);
+    snprintf(kv[k++], 96, "RACACIT_TRILINEAR=%d", o->trilinear);
+    snprintf(kv[k++], 96, "RACACIT_BRIGHTNESS=%d", o->brightness);
     snprintf(kv[k++], 96, "RACACIT_DS_SPEAKER=%d", o->ds_speaker);
     snprintf(kv[k++], 96, "RACACIT_DS_SPK_VOL=%d", o->ds_volume);
     snprintf(kv[k++], 96, "RACACIT_DS_HAPTICS=%d", o->ds_haptics);
@@ -363,9 +384,9 @@ void rsx_host_ui_attach(SDL_Window* win, float max_aniso, float res_scale_active
  * -------------------------------------------------------------------------*/
 enum { K_HEAD, K_OPT, K_ACT, K_GAP };
 enum { R_DISPLAY = 1, R_WINSIZE, R_VSYNC, R_ASPECT, R_UPSCALE, R_SHARP, R_BRIGHT,
-       R_RES, R_ANISO, R_TRI, R_DSSPK, R_DSVOL, R_DSHAP, R_DSHVOL, R_DSRUMBLE, R_DSTRIG, R_DSSWAP,
-       R_DSLIGHT, R_DSMOTION, R_FPS, R_DISCORD, R_SKIPCLANK, R_RESUME, R_QUIT,
-       R_PRESET, R_TEXQ, R_PACE, R_CPU, R_KBM, R_MSENS, R_MINV, R_DSTRIGSTR, R_TROPHIES,
+       R_RES, R_SHADOW, R_ANISO, R_TRI, R_DSSPK, R_DSVOL, R_DSHAP, R_DSHVOL, R_DSRUMBLE, R_DSTRIG, R_DSSWAP,
+       R_DSLIGHT, R_DSMOTION, R_FPS, R_FPSLIMIT, R_DISCORD, R_SKIPCLANK, R_RESUME, R_QUIT,
+       R_PRESET, R_TEXQ, R_PACE, R_KBM, R_MSENS, R_MINV, R_DSTRIGSTR, R_TROPHIES,
        R_FOV, R_CAMDIST };
 typedef struct { int kind, id; const char* label; } ui_row;
 /* Three pages: General, Controls, Trophies */
@@ -374,10 +395,17 @@ static const ui_row k_rows_general[] = {
     { K_OPT, R_DISPLAY, "Display mode" },
     { K_OPT, R_WINSIZE, "Window size" },
     { K_OPT, R_VSYNC,   "VSync" },
+    { K_OPT, R_FPSLIMIT, "FPS limit" },
     { K_OPT, R_ASPECT,  "Aspect ratio" },
     { K_OPT, R_FPS,     "FPS counter" },
-    { K_HEAD, 0, "Performance" },
-    { K_OPT, R_CPU,     "CPU profile" },
+    { K_HEAD, 0, "Graphics" },
+    { K_OPT, R_RES,     "Internal resolution" },
+    { K_OPT, R_SHADOW,  "Shadow resolution" },
+    { K_OPT, R_UPSCALE, "Upscaling" },
+    { K_OPT, R_SHARP,   "Sharpness" },
+    { K_OPT, R_ANISO,   "Anisotropic filtering" },
+    { K_OPT, R_TRI,     "Trilinear filtering" },
+    { K_OPT, R_BRIGHT,  "Brightness" },
     { K_GAP, 0, "" },
     { K_ACT, R_RESUME,  "Resume" },
     { K_ACT, R_QUIT,    "Quit game" },
@@ -481,10 +509,21 @@ static void value_text(int id, const rsx_host_options* o, char* b, size_t n)
                                        : o->vsync == RSX_UI_VSYNC_IMMEDIATE ? "Off (allow tearing)" : "Off (no tearing)"); break;
     case R_ASPECT:  snprintf(b, n, "%s", o->keep_aspect ? "16:9" : "Stretch to window"); break;
     case R_FPS:     snprintf(b, n, "%s", o->fps ? "On" : "Off"); break;
-    case R_CPU:     snprintf(b, n, "%s", o->cpu_mode == 1 ? "Xeon / Multi-core" : "General (Default)"); break;
+    case R_FPSLIMIT: if (o->fps_limit > 0) snprintf(b, n, "%d FPS", o->fps_limit); else snprintf(b, n, "Unlimited"); break;
     case R_UPSCALE: snprintf(b, n, "%s", o->upscale == RSX_UI_UPSCALE_SHARP ? "Sharp (bicubic + sharpen)"
                                        : o->upscale == RSX_UI_UPSCALE_NEAREST ? "Nearest (pixelated)" : "Bilinear"); break;
     case R_SHARP:   snprintf(b, n, "%d%%", o->sharpness * 10); break;
+    case R_BRIGHT:  if (o->brightness == 0) snprintf(b, n, "Default"); else snprintf(b, n, "%+d", o->brightness); break;
+    case R_RES: {
+        const float s = o->res_scale;
+        const char* tag = (s >= 2.9f) ? "4K" : (s >= 1.9f) ? "1440p"
+                        : (s >= 1.4f) ? "1080p" : (s >= 0.9f) ? "720p" : (s >= 0.7f) ? "540p" : "360p";
+        const float d = s - s_rs_active;
+        snprintf(b, n, "%.2fx (%s)%s", (double)s, tag, (d > 0.02f || d < -0.02f) ? " (restart)" : "");
+        break; }
+    case R_SHADOW:  snprintf(b, n, "%dx (restart)", o->shadow_res); break;
+    case R_ANISO:   if (o->aniso >= 2) snprintf(b, n, "%dx", o->aniso); else snprintf(b, n, "Off"); break;
+    case R_TRI:     snprintf(b, n, "%s", o->trilinear ? "On" : "Off"); break;
     case R_DSSPK:   snprintf(b, n, "%s", o->ds_speaker ? "On" : "Off"); break;
     case R_DSVOL:   snprintf(b, n, "%d%%", o->ds_volume); break;
     case R_DSHAP:   snprintf(b, n, "%s", o->ds_haptics ? "On" : "Off (rumble motors)"); break;
@@ -531,12 +570,34 @@ static void adjust(int id, int dir)
     case R_VSYNC:   o->vsync = cycle(o->vsync, 3, dir); o->swap_gen++; break;
     case R_ASPECT:  o->keep_aspect = !o->keep_aspect; break;
     case R_FPS:     o->fps = !o->fps; break;
-    case R_CPU:
-        o->cpu_mode = !o->cpu_mode;
-        g_racacit_spu_spin_us = o->cpu_mode ? 200 : 30;
-        break;
+    case R_FPSLIMIT: {
+        static const int k_fps[] = { 0, 30, 60, 120 };
+        int cur = 0;
+        for (int i = 0; i < (int)N_OF(k_fps); i++) if (k_fps[i] == o->fps_limit) cur = i;
+        cur = cycle(cur, N_OF(k_fps), dir);
+        o->fps_limit = k_fps[cur];
+        g_racacit_fps_limit = o->fps_limit;
+        break; }
     case R_UPSCALE: o->upscale = cycle(o->upscale, 3, dir); break;
     case R_SHARP:   o->sharpness = clampi(o->sharpness + dir, 0, 10); break;
+    case R_BRIGHT:  o->brightness = clampi(o->brightness + dir, -5, 5); break;
+    case R_RES: {
+        static const float k_res[] = { 0.50f, 0.75f, 1.00f, 1.50f, 2.00f, 3.00f };
+        int cur = 2; float best = 999.0f;
+        for (int i = 0; i < (int)N_OF(k_res); i++) {
+            float d = o->res_scale - k_res[i]; if (d < 0) d = -d;
+            if (d < best) { best = d; cur = i; }
+        }
+        cur = cycle(cur, N_OF(k_res), dir);
+        o->res_scale = k_res[cur]; break; }
+    case R_SHADOW:  o->shadow_res = 1 + cycle(o->shadow_res - 1, 4, dir); break;
+    case R_ANISO: {
+        static const int k_aniso[] = { 0, 2, 4, 8, 16 };
+        int cur = 0;
+        for (int i = 0; i < (int)N_OF(k_aniso); i++) if (k_aniso[i] == o->aniso) cur = i;
+        cur = cycle(cur, N_OF(k_aniso), dir);
+        o->aniso = k_aniso[cur]; o->sampler_gen++; break; }
+    case R_TRI:     o->trilinear = !o->trilinear; o->sampler_gen++; break;
     case R_DSSPK:   o->ds_speaker = !o->ds_speaker; break;
     case R_DSVOL:   o->ds_volume = clampi(o->ds_volume + dir * 5, 0, 100); break;
     case R_DSHAP:   o->ds_haptics = !o->ds_haptics; break;
@@ -956,18 +1017,19 @@ void rsx_host_ui_on_present(void)
         const double d = s_ft[(s_ft_n - 1 - i) % N_OF(s_ft)];
         sum += d; n++; if (d > worst) worst = d;
     }
-    char b[64];
+    char b[64], title[128];
     if (n && sum > 0.0) snprintf(b, sizeof b, "%.0f FPS   %.1f ms   (worst %.0f ms)", n * 1000.0 / sum, sum / n, worst);
     else snprintf(b, sizeof b, "-- FPS");
-    LOCK(); memcpy(s_fps_text, b, sizeof b); UNLOCK();
-    if (s_win) {
-        char title[128];
-        if (n && sum > 0.0)
-            snprintf(title, sizeof title, "Ratchet & Clank: Into the Nexus - %.0f FPS (%.1f ms)", n * 1000.0 / sum, sum / n);
-        else
-            snprintf(title, sizeof title, "Ratchet & Clank: Into the Nexus");
-        SDL_SetWindowTitle(s_win, title);
-    }
+    if (n && sum > 0.0)
+        snprintf(title, sizeof title, "Ratchet & Clank: Into the Nexus - %.0f FPS (%.1f ms)", n * 1000.0 / sum, sum / n);
+    else
+        snprintf(title, sizeof title, "Ratchet & Clank: Into the Nexus");
+    /* Queue the window title for the event thread; calling SDL_SetWindowTitle from
+     * the render worker sends synchronous WM_SETTEXT and deadlocks if frame_clock waits. */
+    LOCK();
+    memcpy(s_fps_text, b, sizeof b);
+    if (s_win) { memcpy(s_title_pending, title, sizeof s_title_pending); s_title_dirty = 1; }
+    UNLOCK();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1981,6 +2043,13 @@ void rsx_host_ui_request_menu(void) { s_menu_req = 1; }
 
 void rsx_host_ui_poll_script(void)
 {
+    if (s_win) {
+        char title[128]; int has_title = 0;
+        LOCK();
+        if (s_title_dirty) { memcpy(title, s_title_pending, sizeof title); s_title_dirty = 0; has_title = 1; }
+        UNLOCK();
+        if (has_title) SDL_SetWindowTitle(s_win, title);
+    }
     if (s_menu_req) { s_menu_req = 0; if (!s_open) { s_menu_src = "Select held"; open_menu(1); } }
     static const char* path = (const char*)-1;
     if (path == (const char*)-1) path = getenv("RACACIT_UI_FILE");

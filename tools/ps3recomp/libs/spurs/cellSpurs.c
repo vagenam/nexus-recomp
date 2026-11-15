@@ -1589,6 +1589,12 @@ static DWORD WINAPI spurs_lane_thread(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     struct spurs_lane_arg* a = (struct spurs_lane_arg*)p;
+#ifdef _WIN32
+    if (a->spu_num < 4u) {
+        extern int ps3_host_place_thread(int role, int idx);
+        ps3_host_place_thread(1, (int)a->spu_num);
+    }
+#endif
     unsigned idle = 0;
     { char _hb[160]; snprintf(_hb, sizeof _hb, "[hosttid] %lu spurs lane wid=%u spu=%u%c", (unsigned long)GetCurrentThreadId(), a->wid, a->spu_num, 10); fputs(_hb, stderr); }
 #ifdef _WIN32

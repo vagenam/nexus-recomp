@@ -226,6 +226,13 @@ static inline u32 rsx_dsp_resolve_vertex_index(u32 index, u32 base_index)
     return (index + base_index) & 0x000FFFFFu;
 }
 
+/* RSX adds VERTEX_DATA_BASE_OFFSET to an array's offset and masks the sum to
+ * 28 bits before translating it through the array's location (RPCS3 get_vertex_offset_from_base). */
+static inline u32 rsx_dsp_resolve_vertex_offset(u32 base_offset, u32 array_offset)
+{
+    return (base_offset + array_offset) & 0x0FFFFFFFu;
+}
+
 /* Index array state (IDXBUF_OFFSET / IDXBUF_FORMAT) */
 typedef struct rsx_dsp_index_array {
     u32 offset;

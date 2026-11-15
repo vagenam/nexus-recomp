@@ -37,7 +37,7 @@ static volatile long g_lockline_waiters = 0;
 typedef BOOL (WINAPI* woa_fn)(volatile VOID*, PVOID, SIZE_T, DWORD);
 typedef VOID (WINAPI* wba_fn)(PVOID);
 static woa_fn s_woa; static wba_fn s_wba; static volatile int s_ll_init;
-static int s_ll_spin = 4096;
+static int s_ll_spin = 512;
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, yield after a while, and then really wait. The bare exchange loop let
  * GH3's four idle job-policy pollers saturate the line and delay every other SPU

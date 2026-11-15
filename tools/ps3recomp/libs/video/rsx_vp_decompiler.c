@@ -470,7 +470,7 @@ static int rsx_vp_decompile_impl(
                     char line[256];
                     snprintf(line,sizeof line,
                         "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
-                        A, addr_sel, m, m);
+                        A, dst_tmp & 1u, m, m);
                     emit(&b, line);
                 }
                 handled = 0;

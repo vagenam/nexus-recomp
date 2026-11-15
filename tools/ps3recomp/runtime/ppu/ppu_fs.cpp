@@ -14,6 +14,7 @@
  * through vm_base in big-endian.
  */
 #include "ppu_recomp.h"      /* ppu_context */
+#include "../ps3_log.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
@@ -308,7 +309,7 @@ static void cellFsOpen(ppu_context* ctx)
           { const char* want = getenv("FS_STACK");
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+      else if (ps3_log_verbose()) fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path

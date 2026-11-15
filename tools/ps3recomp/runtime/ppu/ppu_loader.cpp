@@ -1277,10 +1277,45 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 extern "C" uint32_t g_ww_lo, g_ww_hi;
 
 extern "C" void racacit_ring_note(char op, uint32_t id, uint32_t pc, uint32_t ea, int only_if_changed);
+
+static inline int ppu_stwcx_same_notify(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("PPU_STWCX_SAME_NOTIFY") ? 1 : 0;
+    return s;
+}
+
+static inline int ppu_coh_lock_recheck(ppu_context* self, uint32_t ea32, int coh)
+{
+    if (!coh) return 1;
+    spu_lockline_lock();
+    g_ppu_coh_stores++;
+    /* An SPU commit between resv_lock and spu_lockline_lock can call
+     * ppu_resv_break_line() and clear our reservation without taking resv_lock;
+     * re-check under the lock-line lock before committing. */
+    if (self && self->reserve_addr != ea32) {
+        spu_lockline_unlock();
+        return 0;
+    }
+    return 1;
+}
+
+static inline void ppu_coh_finish(uint32_t ea32, int coh, int ok, int same)
+{
+    if (!coh) return;
+    /* A store-conditional that writes back the identical value (same != 0)
+     * leaves the cache line unchanged — skipping spu_coh_notify_write stops
+     * PPU poll/OR-bit spins from needlessly breaking SPU PUTLLC reservations. */
+    if (ok && (!same || ppu_stwcx_same_notify()))
+        spu_coh_notify_write(ea32);
+    spu_lockline_unlock();
+}
+
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
+    int same = (exp_raw == new_raw);
     if (resv_off())
         return __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
@@ -1304,13 +1339,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) { spu_lockline_lock(); g_ppu_coh_stores++; }
+    if (!ppu_coh_lock_recheck(self, (uint32_t)ea, coh)) { resv_unlock(L); return 0; }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
-    }
+    ppu_coh_finish((uint32_t)ea, coh, ok, same);
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
     if (ok) racacit_ring_note('C', self ? (uint32_t)self->thread_id : 0u, self ? (uint32_t)self->lr : 0u, (uint32_t)ea, 0);
@@ -1368,6 +1400,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 {
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
+    int same = (exp_raw == new_raw);
     if (resv_off())
         return __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw,
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
@@ -1377,12 +1410,9 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) { spu_lockline_lock(); g_ppu_coh_stores++; }
+    if (!ppu_coh_lock_recheck(self, (uint32_t)ea, coh)) { resv_unlock(L); return 0; }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
-    if (coh) {
-        if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
-    }
+    ppu_coh_finish((uint32_t)ea, coh, ok, same);
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {

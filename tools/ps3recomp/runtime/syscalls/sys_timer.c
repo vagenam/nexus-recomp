@@ -557,8 +557,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
         if (usleep_real_sleep((uint32_t)ctx->lr, usec, qpc_start.QuadPart)) return CELL_OK;
+        const uint64_t eff_usec = (usec <= 50 && !racacit_few_cpus()) ? 2 : usec;
         const int64_t qpc_deadline = qpc_start.QuadPart +
-            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+            (int64_t)((eff_usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
         do {
             SwitchToThread();
             QueryPerformanceCounter(&qpc_now);

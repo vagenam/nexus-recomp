@@ -15,6 +15,7 @@
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
+#include "../../runtime/platform/host_placement.h" /* mixer runs on any core under HOST_PLACEMENT */
 #include "audio_stretch.h"                  /* the output: no holes when the game is short */
 #include "ds_player.h"                      /* the DualSense speaker's own player */
 #include "../video/rsx_host_ui.h"           /* Settings: controller speaker on/off, volume */
@@ -1060,13 +1061,8 @@ static void audio_pub_tick(void)
              * nothing to do, just when it is furthest behind. Wait for it at 6
              * (lag counts finished blocks; some of those are on their way), but
              * never for long: it is not this index the game may wait on. */
-            { static unsigned s_steps[CELL_AUDIO_PORT_MAX], s_base[CELL_AUDIO_PORT_MAX]; static u8 s_hold[CELL_AUDIO_PORT_MAX];
-              const int lag = (int)(s_steps[p] - (s_finished[p] - s_base[p]));
-              if (lag >= 6 && s_hold[p] < 16) { s_hold[p]++; if (lag > max_lag) max_lag = lag; continue; }
-              if (s_hold[p] >= 16 || lag < -32) s_base[p] = s_finished[p] - s_steps[p];
-              s_hold[p] = 0;
-              s_steps[p]++;
-              if (lag > max_lag) max_lag = lag; }
+            /* Advance read_idx strictly at 187.5 Hz; holding read_idx starves
+             * games that pace their synth to it (e.g. Into the Nexus). */
             s_pub_steps++;
             port->pub_index++;
             if (port->read_idx_addr)
@@ -1108,12 +1104,13 @@ static int audio_output_stretched(void)
     static double smooth = 1.0;
     static int filling;
     const double have = audio_st_blocks(), err = (double)s_q_target - have;
-    if (have < 1.0) filling = 1; else if (err <= 0.0) filling = 0;
+    const double fill_stop = (double)s_q_target * 0.5;
+    if (have < 0.5) filling = 1; else if (have >= fill_stop) filling = 0;
     double r = 1.0;
-    if (filling) r = 1.02 + (err > 0.0 ? err : 0.0) * 0.1;
+    if (filling) r = 1.02 + (fill_stop - have > 0.0 ? (fill_stop - have) : 0.0) * 0.04;
     else if (err < -20.0) r = 0.92;
     else if (err < -6.0) r = 0.97;
-    if (r > 1.8) r = 1.8;
+    if (r > 1.15) r = 1.15;
     smooth += (r - smooth) * 0.1;
     if (r == 1.0 && fabs(smooth - 1.0) < 0.01) smooth = 1.0;
     ast_set_ratio(&s_st, smooth);
@@ -1132,6 +1129,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     /* It carries the clock the game's synth runs on (audio_pub_tick) and does
      * little else: a late wake here is a late read index for the whole game. */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    ps3_host_unplace_thread();
 #if AUDIO_BACKEND_SDL2
     ast_init(&s_st);
 #endif

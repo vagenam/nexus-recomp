@@ -446,6 +446,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         if (errno == EACCES) return (s32)CELL_EPERM;
         return (s32)CELL_ENOENT;
     }
+    setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 
     CellFsFd slot = alloc_fd();
     if (slot < 0) {

@@ -101,7 +101,8 @@ static u32 s_current_display_buffer_id = 0;
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
-#define GCM_FLIP_MARKER 0xFEAD0100u
+#define GCM_FLIP_MARKER    0xFEAD0100u
+#define GCM_PREPARE_MARKER 0xFEAD0200u
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -117,9 +118,6 @@ int cellGcm_take_flip_pending(void)
     s_flip_pending = 0;
     if (v) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x440, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x430, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x400, 1);
     }
     return v;
 }
@@ -602,19 +600,16 @@ void cellGcmSetFlipMode(u32 mode)
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void)
 {
-    /* Block until the pending flip completes (the present thread marks it done
-     * via cellGcmTickFlip, ~once per display refresh). This throttles the title
-     * to vsync; without it the guest loops unthrottled and many frames batch
-     * into a single host present -> the console text stacks/duplicates. */
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
+    static int block = -1;
+    if (block < 0) { const char* e = getenv("GCM_WAITFLIP_BLOCK"); block = (e && *e && *e != '0') ? 1 : 0; }
+    if (block) {
+        for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+            Sleep(1);
+    }
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    vm_write32(GCM_LABEL_GUEST_BASE + 0x440, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x430, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x400, 1);
 }
 
 /* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
@@ -730,9 +725,6 @@ void ppu_gcm_pump(void)
     if (p & 2) {
         { extern void ps3_tl(char ev, u32 a, u32 b); ps3_tl('H', 0, 0); }
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x440, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x430, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x400, 1);
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -768,9 +760,6 @@ void cellGcmTickFlip(void)
         GCM_PENDING_SET(2);
         ps3_tl('T', s_current_display_buffer_id, 0);
     }
-    vm_write32(GCM_LABEL_GUEST_BASE + 0x440, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x430, 1);
-        vm_write32(GCM_LABEL_GUEST_BASE + 0x400, 1);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -836,7 +825,7 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
-#define GCM_FIFO_CATCHUP_BYTES 0x10000u
+#define GCM_FIFO_CATCHUP_BYTES 0x100000u
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1266,12 +1255,43 @@ static void gcm_park_subch_method(u32 subch, u32 m, u32 data)
         fprintf(stderr, "[park] subchannel %u method 0x%04X = 0x%08X%s%c", subch, m, data, m ? "" : " (SET_OBJECT)", 10);
 }
 
+static void nv0039_report_bytes(u32 report_off, u8* out)
+{
+    const u32 idx = report_off / 16u, rem = report_off % 16u;
+    u8 rec[16]; memset(rec, 0, sizeof rec);
+    if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+        const u64 ts = s_report_data[idx].timestamp;
+        const u32 v  = s_report_data[idx].value;
+        for (int i = 0; i < 8; i++) rec[i] = (u8)(ts >> (56 - 8 * i));
+        for (int i = 0; i < 4; i++) rec[8 + i] = (u8)(v >> (24 - 8 * i));
+    }
+    *out = rec[rem];
+}
+
 static void gcm_nv0039_copy(void)
 {
+    const int from_report = (s_nv0039.dma_in == 0x66626660u);
     const int src_local = s_nv0039.dma_in != 0xFEED0001u, dst_local = s_nv0039.dma_out != 0xFEED0001u;
-    const u32 src = cellGcmResolveLocated(src_local, s_nv0039.off_in);
     const u32 dst = cellGcmResolveLocated(dst_local, s_nv0039.off_out);
     const u32 len = s_nv0039.len, n = s_nv0039.count;
+    if (from_report) {
+        const u32 in_pitch  = s_nv0039.pitch_in  > 0 ? (u32)s_nv0039.pitch_in  : len;
+        const u32 out_pitch = s_nv0039.pitch_out > 0 ? (u32)s_nv0039.pitch_out : len;
+        if (!dst || !len || !n || len > 0x400000u || (u64)len * n > 0x1000000ull ||
+            s_nv0039.pitch_in < 0 || s_nv0039.pitch_out < 0)
+            return;
+        for (u32 i = 0; i < n; i++) {
+            const u32 s0 = s_nv0039.off_in + i * in_pitch;
+            const u32 d0 = dst + i * out_pitch;
+            for (u32 b = 0; b < len; b++) {
+                u8 byte;
+                nv0039_report_bytes(s0 + b, &byte);
+                vm_write8(d0 + b, byte);
+            }
+        }
+        return;
+    }
+    const u32 src = cellGcmResolveLocated(src_local, s_nv0039.off_in);
     const u32 in_fmt = s_nv0039.fmt & 0xFFu, out_fmt = (s_nv0039.fmt >> 8) & 0xFFu;
     static unsigned long long copies, bytes;
     if (!src || !dst || !len || !n || len > (64u << 20) || n > 65536u ||
@@ -1873,6 +1893,7 @@ static int gcm_env_on(const char* name, int* cache)
 }
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    { extern void rsx_be_zpass_poll(void); rsx_be_zpass_poll(); }
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -1918,7 +1939,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * when they arrived, and the poll (a GetWriteWatch per range) per drain
      * call was 2% of the render thread in Axiom. */
     { extern void rsx_ww_poll(void); static u32 s_ww_put = 0xFFFFFFFFu;
-      if (put != s_ww_put) { s_ww_put = put; rsx_ww_poll(); } }
+      static unsigned long long s_ww_last_us = 0;
+      if (put != s_ww_put) {
+          s_ww_put = put;
+          const unsigned long long now_us = ps3_qpc_us();
+          if (now_us - s_ww_last_us >= 8000ull) { s_ww_last_us = now_us; rsx_ww_poll(); }
+      } }
 
     /* GCM_CTXDBG=1: which context the title is actually driving. Ours is written
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
@@ -2017,8 +2043,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    /* `put` is live, as on the RSX (ported from resistance-recomp): re-read it
+     * every few words and after JUMP/CALL/RET so linked side buffers cannot be overrun. */
+    static int s_put_live = -1;
+    if (s_put_live < 0) { const char* e = getenv("GCM_PUT_LIVE"); s_put_live = !(e && e[0] == '0'); }
+    u32 put_reread = 0;
 
     while (s_fifo_getoff != put && budget-- > 0) {
+        if (s_put_live && (++put_reread & 7u) == 0) {
+            put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (s_fifo_getoff == put) break;
+        }
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
@@ -2080,9 +2116,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_current_display_buffer_id = w & 7u;
                 s_flip_pending = 1;
                 s_flip_request_count++;
+            } else if ((w & 0xFFFFFF00u) == GCM_PREPARE_MARKER) {
+                s_current_display_buffer_id = w & 7u;
+                s_flip_pending = 1;
+                s_flip_request_count++;
+                s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+                s_last_flip_time = get_timestamp_ns();
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2122,7 +2165,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   break;
               }
               gcm_cf_push('J', s_fifo_getoff, tgt, put);
-              s_fifo_getoff = tgt; gcm_publish_get_early(tgt); }
+              s_fifo_getoff = tgt; gcm_publish_get_early(tgt); put_reread = 7u; }
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
@@ -2130,13 +2173,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               gcm_cf_push(s_fifo_calloff ? 'N' : 'C', s_fifo_getoff, tgt, put);   /* N = nested CALL */
               s_fifo_calloff = s_fifo_getoff + 4;
-              s_fifo_getoff  = tgt; }
+              s_fifo_getoff  = tgt;
+              put_reread = 7u; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
             gcm_cf_push('R', s_fifo_getoff, s_fifo_calloff, put);   /* to == 0: no CALL outstanding */
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
+            put_reread = 7u;
             continue;
         }
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
@@ -2203,15 +2248,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) { gcm_publish_get_early(s_fifo_getoff + 4 + count * 4); vm_write32(la, v); }
                     else if (m == 0x68u) {
-            /* ACQUIRE blocks until the label holds the value, as on the
-             * hardware. If this is a flip sync label (0x440, 0x430, 0x400) and wants 1:
-             * when no flip is pending and flip status is DONE, display is idle. */
-            u32 sem_label_off = s_sema_offset & 0xFFFFu;
-            if ((sem_label_off == 0x440 || sem_label_off == 0x430 || sem_label_off == 0x400) && v == 1) {
-                if (!s_flip_pending && s_flip_status == CELL_GCM_FLIP_STATUS_DONE) {
-                    vm_write32(la, 1);
-                }
-            }
             static unsigned long long n_acq, n_early; static u32 last_early = ~0u;
             const int early = vm_read32(la) != v;
             if (s_fifo_getoff != last_early) {                 /* each wait once, not each re-check */
@@ -2483,6 +2519,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                    rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     /* With the draw engine rendering, rsx_commands' state has no
                      * consumer: only its effects outside that state are needed --
@@ -2491,12 +2528,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int eng_only = -1;
                       if (eng_only < 0) eng_only = rsx_draw_engine_enabled() && !rsx_get_backend();
                       extern void rsx_stats_count(u32 method);
+                      static int s_zpass_dirty = 0;
                       if (!eng_only || m == 0x50 || (m >= 0x1D6C && m <= 0x1D74)) {
+                          if (m == 0x1D70u && s_zpass_dirty) s_zpass_dirty = 0;
                           rsx_process_method(&s_state, m, vm_read32(dea));
                           if (m == 0x1D70u || m == 0x1D74u) gcm_publish_get_early(s_fifo_getoff + 4 + count * 4);
                       }
                       else
-                          rsx_stats_count(m); }
+                          rsx_stats_count(m);
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -2508,41 +2547,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x1A8) s_dma_report = vm_read32(dea);   /* NV4097_SET_CONTEXT_DMA_REPORT */
                     if (m == 0x1800) {
                         const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
-                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                        /* GCM_REPORT_LOG=<n>: every GET_REPORT (either DMA) for the first n. */
-                        { static long cap = -1; static long nn = 0;
-                          if (cap < 0) { const char* e = getenv("GCM_REPORT_LOG"); cap = e ? atol(e) : 0; }
-                          if (nn < cap) { nn++;
-                              fprintf(stderr, "[GET_REPORT*] type=%u offset=0x%X dma=0x%08X%c", v >> 24, off, s_dma_report, 10); } }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            s_report_data[idx].value = val;
+                        if ((v >> 24) == 1u) {
+                            extern void rsx_be_zpass_get_report_async(u32 idx, u32 dma, u32 off);
+                            s_zpass_dirty = 1;
+                            rsx_be_zpass_get_report_async(idx, s_dma_report, off);
+                        } else {
+                            extern void cellGcm_write_report_async(u32 dma_report, u32 off, u32 val);
+                            cellGcm_write_report_async(s_dma_report, off, 0u);
                         }
-                        /* A statically linked libgcm reads the report straight
-                         * from guest memory: CellGcmReportData { u64 timer; u32
-                         * value; u32 zero } at the report DMA's base + offset.
-                         * A Crack in Time zeroes `timer`, issues the query and
-                         * polls for a non-zero timer with a ONE SECOND timeout
-                         * (func_005D7B40) -- with nothing written here every
-                         * level frame took exactly that second. Main-memory
-                         * reports sit in IO space: at 0x0E000000 + offset when
-                         * the title mapped that range, else at the offset. */
-                        if (s_dma_report != 0x66626660u) {          /* not the local report area */
-                            u32 rea = gcm_io2ea(0x0E000000u + off);
-                            if (!rea) rea = gcm_io2ea(off);
-                            { static int rn = 0; if (rn < 8) { rn++;
-                                fprintf(stderr, "[GET_REPORT] type=%u offset=0x%X dma=0x%08X -> EA 0x%08X%c",
-                                        v >> 24, off, s_dma_report, rea, 10); } }
-                            if (rea) {
-                                u64 t = get_timestamp_ns() / 1000u;
-                                if (!t) t = 1;
-                                vm_write32(rea + 8,  val);
-                                vm_write32(rea + 12, 0);
-                                vm_write32(rea + 4, (u32)t);
-                                vm_write32(rea + 0, (u32)(t >> 32) | 0x80000000u);   /* timer last: it is the "done" word */
-                            }
-                        }
-                    }
+                    } }
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
@@ -2965,7 +2978,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); 
  * at ctx->current instead; the drain stops at it and fires the flip there,
  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
-static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+static int gcm_word_into_fifo(u32 ctx, u32 bufferId, u32 word)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
@@ -2973,7 +2986,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
-    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+    vm_write32(cur, word);
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
      * (see "recycled the title's own ring"), rewriting ctx->current and put
@@ -2992,12 +3005,18 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     return 1;
 }
 
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+{
+    return gcm_word_into_fifo(ctx, bufferId, GCM_FLIP_MARKER | bufferId);
+}
+
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
  * gcmSetFlip import (NID 0xDC09357E) lands here; without it vkcube's flip was
  * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
-    (void)context;   /* command context — flip is immediate in HLE */
+    if (gcm_flip_into_fifo((u32)(uintptr_t)context, bufferId))
+        return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
 }
 
@@ -3017,29 +3036,20 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 /* NID: 0xA2478CA3 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
-    (void)ctx;  /* command buffer context -- not used in HLE */
-
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+    { static int n = 0; if (n < 8 && ++n)
+        printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId); }
 
-    s_current_display_buffer_id = bufferId;
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
+    if (gcm_word_into_fifo((u32)(uintptr_t)ctx, bufferId, GCM_PREPARE_MARKER | bufferId))
+        return (s32)bufferId;
 
-    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
-     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
-     * GCM_FLIPCB_ONTICK exists. */
-    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
-        g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    return CELL_OK;
+    gcm_flip_request(bufferId, 0);
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
@@ -3480,11 +3490,52 @@ u32 cellGcmResolveLocated(int local, u32 offset)
 /* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index)
 {
-    if (index >= CELL_GCM_MAX_LABEL_COUNT) {
+    if ((u32)index >= CELL_GCM_MAX_LABEL_COUNT) {
         printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
         return NULL;
     }
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
+}
+
+void cellGcm_write_report_async(u32 dma_report, u32 off, u32 val)
+{
+    const u32 idx = off / 16u;
+    u64 t = get_timestamp_ns();
+    if (!t) t = 1;
+    if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+        s_report_data[idx].timestamp = t;
+        s_report_data[idx].value = val;
+    }
+    if (dma_report == 0x66626660u) {
+        if (off + 16u <= 0x1000u) {
+            const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
+            vm_write32(rea + 0, (u32)(t >> 32));
+            vm_write32(rea + 4, (u32)t);
+            vm_write32(rea + 8, val);
+            vm_write32(rea + 12, 0u);
+        }
+        u32 lea = gcm_io2ea(0x0E000000u + off);
+        if (!lea && s_config.localAddress && off + 16u <= 0x100000u &&
+            0x0E000000u + off + 16u <= s_config.localSize)
+            lea = s_config.localAddress + 0x0E000000u + off;
+        if (lea) {
+            vm_write32(lea + 0, (u32)(t >> 32));
+            vm_write32(lea + 4, (u32)t);
+            vm_write32(lea + 8, val);
+            vm_write32(lea + 12, 0u);
+        }
+    } else {
+        u32 rea = gcm_io2ea(off);
+        if (!rea) rea = gcm_io2ea(0x0E000000u + off);
+        if (rea) {
+            u64 t_us = t / 1000u;
+            if (!t_us) t_us = 1;
+            vm_write32(rea + 8,  val);
+            vm_write32(rea + 12, 0);
+            vm_write32(rea + 4, (u32)t_us);
+            vm_write32(rea + 0, (u32)(t_us >> 32) | 0x80000000u);
+        }
+    }
 }
 
 /* NID: 0x8572ADE4 */
@@ -3733,8 +3784,12 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
                                         u32 labelIndex, u32 labelValue)
 {
-    (void)ctx;
-    return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
+    if (labelIndex >= CELL_GCM_MAX_LABEL_COUNT)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    vm_write32(GCM_LABEL_GUEST_BASE + labelIndex * GCM_LABEL_STRIDE, labelValue);
+    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+        return gcm_flip_request(bufferId, 1);
+    return cellGcmSetFlipCommand(bufferId);
 }
 
 /* ---------------------------------------------------------------------------

@@ -22,9 +22,19 @@ static float rsx_compact_be_f16(const u8* p)
     const u32 exp = (h >> 10) & 0x1F;
     const u32 man = h & 0x3FF;
     u32 out;
-    if (exp == 0)
-        out = sign;
-    else if (exp == 31)
+    if (exp == 0) {
+        if (man == 0) {
+            out = sign;
+        } else {
+            u32 m = man;
+            u32 e = 113u; /* 127 - 14 */
+            while ((m & 0x400u) == 0u) {
+                m <<= 1;
+                e--;
+            }
+            out = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 31)
         out = sign | 0x7F800000u | (man << 13);
     else
         out = sign | ((exp + 112) << 23) | (man << 13);
@@ -237,7 +247,7 @@ void rsx_vertex_fetch_plan_prepare(
         }
 
         const u64 prefix =
-            (u64)plan->base_offset + (u64)fetch->desc.offset;
+            (u64)rsx_dsp_resolve_vertex_offset(plan->base_offset, fetch->desc.offset);
         const u64 start = prefix + (u64)first * fetch->stride;
         const u64 end =
             prefix + (u64)last * fetch->stride + fetch->elem_size;
@@ -287,7 +297,7 @@ int rsx_vertex_fetch_one(
             source = NULL;
         } else if (plan->guest_ptr) {
             const u32 offset =
-                plan->base_offset + fetch->desc.offset +
+                rsx_dsp_resolve_vertex_offset(plan->base_offset, fetch->desc.offset) +
                 element * fetch->stride;
             source = plan->guest_ptr(
                 plan->guest_user, fetch->desc.location, offset,
@@ -333,7 +343,7 @@ static int rsx_vertex_fetch_slot_fast(
             /* Outside the span prepare mapped: the per-element path. */
             if (!plan->guest_ptr) return 0;
             const u8* src = plan->guest_ptr(plan->guest_user, fetch->desc.location,
-                plan->base_offset + fetch->desc.offset + element * stride, fetch->elem_size);
+                rsx_dsp_resolve_vertex_offset(plan->base_offset, fetch->desc.offset) + element * stride, fetch->elem_size);
             if (!src || !rsx_vertex_decode_element(type, fetch->desc.size, src, v)) {
                 if (attr == 0) return -1;
                 memcpy(v, fetch->default_value, 16);

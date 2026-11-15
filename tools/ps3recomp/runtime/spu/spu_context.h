@@ -123,6 +123,7 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 #define MFC_GETL_CMD        0x44
 #define MFC_GETLB_CMD       0x45
 #define MFC_GETLF_CMD       0x46
+#define MFC_SDCRZ_CMD       0x89   /* storage-control range zero (no LS operand) */
 #define MFC_SNDSIG_CMD      0xA0
 #define MFC_BARRIER_CMD     0xC0
 #define MFC_EIEIO_CMD       0xC8
@@ -354,6 +355,25 @@ typedef struct spu_context {
      * spu_channels.c casts to the real types. */
     void* ch_wait_cv;
     void* ch_wait_lock;
+    void* ch_wake_ev;
+
+    /* --- Async MFC list (faithful ordering) ---
+     * A wrch MFC_Cmd list transfer is queued here (mfc_do_list_transfer in
+     * spu_dma.h) and run by spu_mfc_pending_pump once the SPU has moved on
+     * past the wrch, so a barriered list's stall-and-notify -- and the SPU
+     * interrupt it raises -- lands after the arming code has executed. The
+     * old inline path delivered the SN before the WWS job manager's
+     * loadJobState store, so the handler saw kNone and never advanced the
+     * job (intermittent boot stalls / mid-game frame freezes).
+     * mfc_list_pending == 0: nothing queued (zeroed at context init). */
+    uint32_t mfc_list_pending;
+    uint32_t mfc_list_hold;        /* ctx->steps at queue time */
+    uint32_t mfc_list_lsa;         /* first element lsa */
+    uint32_t mfc_list_num;         /* element count */
+    uint32_t mfc_list_dest_lsa;
+    uint64_t  mfc_list_ea_base;
+    uint32_t mfc_list_cmd;         /* base cmd, list bit stripped */
+    uint32_t mfc_list_tag;
 
     /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
      * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while
@@ -926,6 +946,8 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
             spu_task_launch_check((ctx), (void*)_tf);          \
+            { extern void spu_mfc_pending_pump(spu_context*);  \
+              spu_mfc_pending_pump(ctx); }                     \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \

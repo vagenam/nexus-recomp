@@ -115,7 +115,7 @@ static const char* dlerror(void)
     X(vkInvalidateMappedMemoryRanges) \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
-    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) \
+    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkGetFenceStatus) X(vkQueueSubmit) \
     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
@@ -131,7 +131,8 @@ static const char* dlerror(void)
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -981,9 +982,11 @@ static int vk_invalidate(vk_buffer* b)
  * it runs. Objects destroyed while a batch may still use them are parked on
  * that batch's garbage list until its fence signals.
  * -------------------------------------------------------------------------*/
-#define VK_BT_SLOTS     3
-#define VK_BT_ARENA     (48u << 20)
+#define VK_BT_SLOTS     4
+#define VK_BT_ARENA     (64u << 20)
 #define VK_BT_SETS      4096u
+#define VK_ZPASS_QUERIES 8192u
+#define VK_ZPASS_SLOTS   4096u
 typedef struct { int kind; uint64_t a, b, c; } vk_garbage;   /* 1 buffer 2 image 3 framebuffer 5 geometry block 8 pooled image */
 static void vk_geo_free_now(u32 h);
 typedef struct {
@@ -993,9 +996,42 @@ typedef struct {
     vk_buffer       arena;
     VkDeviceSize    used;
     VkDescriptorPool pool;
+    VkQueryPool     zpass_pool;
+    u32             zpass_used;
+    u32             zpass_group[VK_ZPASS_QUERIES];
+    u32             zpass_idx[VK_ZPASS_QUERIES];
+    u32             zpass_dma[VK_ZPASS_QUERIES];
+    u32             zpass_off[VK_ZPASS_QUERIES];
+    u32             zpass_dbg[VK_ZPASS_QUERIES];
+    u32             zpass_vc[VK_ZPASS_QUERIES];
+    u32             zpass_nlabels;
+    u32             zpass_label_ea[8];
+    u32             zpass_label_val[8];
     vk_garbage*     gb;
     u32             ngb, capgb;
 } vk_bt_slot;
+static u32 s_zpass_enabled;
+static u32 s_zpass_seq = 1u;
+static u32 s_zpass_map_key[VK_ZPASS_SLOTS];
+static u32 s_zpass_map_val[VK_ZPASS_SLOTS];
+static u8  s_zpass_map_used[VK_ZPASS_SLOTS];
+
+static int zpass_find_slot(u32 idx, int create)
+{
+    u32 h = (idx * 2654435761u) & (VK_ZPASS_SLOTS - 1u);
+    for (u32 i = 0; i < VK_ZPASS_SLOTS; i++) {
+        u32 s = (h + i) & (VK_ZPASS_SLOTS - 1u);
+        if (!s_zpass_map_used[s]) {
+            if (!create) return -1;
+            s_zpass_map_used[s] = 1u;
+            s_zpass_map_key[s] = idx;
+            s_zpass_map_val[s] = 0xFFFFu;
+            return (int)s;
+        }
+        if (s_zpass_map_key[s] == idx) return (int)s;
+    }
+    return -1;
+}
 static struct {
     vk_bt_slot      s[VK_BT_SLOTS];
     u32             cur;
@@ -1156,6 +1192,47 @@ static int vk_bt_wait_slot(vk_bt_slot* sl)
       s_vkt_wait_us += d_; s_vkt_waits++; g_rsx_gpu_wait_us += d_; }
     pvkResetFences(s_vk.device, 1, &sl->fence);
     sl->submitted = 0;
+    if (sl->zpass_pool && sl->zpass_used) {
+        uint64_t qres[VK_ZPASS_QUERIES];
+        VkResult qr = pvkGetQueryPoolResults(s_vk.device, sl->zpass_pool, 0, sl->zpass_used,
+                                             sl->zpass_used * sizeof(uint64_t), qres,
+                                             sizeof(uint64_t),
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qr != VK_SUCCESS) {
+            static int qr_log;
+            if (qr_log < 16) { qr_log++; fprintf(stderr, "[zpass-qr] qr=%d used=%u\n", (int)qr, sl->zpass_used); }
+        }
+        if (qr == VK_SUCCESS) {
+            for (u32 q = 0; q < sl->zpass_used; q++) {
+                u32 idx = sl->zpass_idx[q];
+                if (idx != 0xFFFFFFFFu) {
+                    int s = zpass_find_slot(idx, 1);
+                    if (s >= 0) s_zpass_map_val[s] = 0u;
+                }
+            }
+            for (u32 q = 0; q < sl->zpass_used; q++) {
+                u32 idx = sl->zpass_idx[q];
+                if (idx != 0xFFFFFFFFu) {
+                    int s = zpass_find_slot(idx, 0);
+                    if (s >= 0) {
+                        uint64_t v = (uint64_t)s_zpass_map_val[s] + qres[q];
+                        s_zpass_map_val[s] = (v > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (u32)v;
+                        if (sl->zpass_dma[q]) {
+                            extern void cellGcm_write_report_async(u32 dma_report, u32 off, u32 val);
+                            cellGcm_write_report_async(sl->zpass_dma[q], sl->zpass_off[q], s_zpass_map_val[s]);
+                            sl->zpass_dma[q] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        sl->zpass_used = 0;
+    }
+    for (u32 i = 0; i < sl->zpass_nlabels; i++) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        vm_write32(sl->zpass_label_ea[i], sl->zpass_label_val[i]);
+    }
+    sl->zpass_nlabels = 0;
     vk_bt_free_garbage(sl);
     return 0;
 }
@@ -1180,6 +1257,10 @@ static int vk_bt_open(void)
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     VK_CHECK(pvkBeginCommandBuffer(sl->cmd, &bi), "vkBeginCommandBuffer");
+    if (sl->zpass_pool) {
+        pvkCmdResetQueryPool(sl->cmd, sl->zpass_pool, 0, VK_ZPASS_QUERIES);
+        sl->zpass_used = 0;
+    }
     s_vk.cmd = sl->cmd;
     s_bt.recording = 1;
     s_bt.epoch++;
@@ -1209,7 +1290,9 @@ static int vk_bt_submit(int wait, VkSemaphore wait_sem, VkSemaphore signal_sem)
 #endif
     { const unsigned long long _t0 = ps3_qpc_us();
       VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, sl->fence), "vkQueueSubmit");
-      s_vkt_submit_us += ps3_qpc_us() - _t0; s_vkt_submits++; }
+      { const unsigned long long _d = ps3_qpc_us() - _t0;
+        s_vkt_submit_us += _d; s_vkt_submits++;
+        extern unsigned long long g_rsx_submit_us; g_rsx_submit_us += _d; } }
     sl->submitted = 1;
     s_bt.cur = (s_bt.cur + 1) % VK_BT_SLOTS;
     if (wait) for (u32 i = 0; i < VK_BT_SLOTS; i++) vk_bt_wait_slot(&s_bt.s[i]);
@@ -1257,6 +1340,12 @@ static int vk_bt_init(void)
         VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                            .maxSets = VK_BT_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
         VK_CHECK(pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &sl->pool), "vkCreateDescriptorPool(batch)");
+        VkQueryPoolCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                      .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                      .queryCount = VK_ZPASS_QUERIES };
+        if (pvkCreateQueryPool(s_vk.device, &qci, NULL, &sl->zpass_pool) != VK_SUCCESS)
+            sl->zpass_pool = VK_NULL_HANDLE;
+        sl->zpass_used = 0;
     }
     s_bt.ready = 1;
     return 0;
@@ -1274,6 +1363,7 @@ static void vk_bt_shutdown(void)
         free(sl->gb); sl->gb = NULL; sl->capgb = 0;
         vk_destroy_buffer(&sl->arena);
         if (sl->pool) pvkDestroyDescriptorPool(s_vk.device, sl->pool, NULL);
+        if (sl->zpass_pool) { pvkDestroyQueryPool(s_vk.device, sl->zpass_pool, NULL); sl->zpass_pool = VK_NULL_HANDLE; }
         if (sl->fence) pvkDestroyFence(s_vk.device, sl->fence, NULL);
     }
     s_vk.cmd = s_bt.sync_cmd;
@@ -3350,13 +3440,9 @@ static void vk_present_window(void)
         if (s_vk_win_minimized || !s_vk.windowed || !s_vk.swapchain) return;
     }
 
-#ifdef __ANDROID__
-    /* Android: the frame's drawing goes to the GPU now, before the swapchain
-     * image is acquired; only the copy onto that image waits for it. Gated on
-     * the acquire, the whole frame waited for the compositor to hand an image
-     * back. */
+    /* Submit the frame's drawing to the GPU before acquiring the swapchain
+     * image; only the compose/blit onto the swapchain image waits for acquire. */
     if (s_bt.ready && s_bt.recording) vk_bt_submit(0, VK_NULL_HANDLE, VK_NULL_HANDLE);
-#endif
     u32 idx = 0;
     unsigned long long pw0 = ps3_qpc_us();
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -3388,8 +3474,8 @@ static void vk_present_window(void)
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
     if (s_bt.ready) {
-        /* The frame's batch goes to the GPU here, gated on the acquire and
-         * signalling the present -- no CPU wait. */
+        extern void rsx_vk_zpass_poll(void);
+        rsx_vk_zpass_poll();
         if (vk_bt_submit(0, s_vk.sem_acquire, s_vk.sc_done[idx])) { VK_LOG("vkQueueSubmit (window) failed\n"); return; }
     } else {
         if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
@@ -3715,10 +3801,14 @@ static void vk_cb_present(void* ud, u32 buffer_id)
      * dump (on the presents it keeps) or a headless run's centre-pixel check.
      * A windowed frame goes straight to the swapchain with no CPU wait. */
     if (s_bt.ready) {
-        static long s_every = -1;
+        static long s_every = -1, s_from = -1, s_cnt = -1;
         if (s_every < 0) { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
                            s_every = e ? atol(e) : 1; if (s_every < 1) s_every = 1; }
-        const int dump_this = s_vk.dump_path && (s_vk.presented % (u32)s_every) == 0;
+        if (s_from < 0) { const char* e = getenv("PS3RECOMP_VK_DUMP_FROM"); s_from = e ? atol(e) : 0; }
+        if (s_cnt < 0) { const char* e = getenv("PS3RECOMP_VK_DUMP_COUNT"); s_cnt = e ? atol(e) : 0; }
+        const int dump_this = s_vk.dump_path && s_vk.presented >= (u32)s_from &&
+                              (!s_cnt || s_vk.presented < (u32)(s_from + s_cnt)) &&
+                              (s_vk.presented % (u32)s_every) == 0;
         if (!dump_this && (s_vk.windowed || s_vk.dump_path)) {
             s_vk.presented++;
             s_g.last_draws = s_g.draws;
@@ -4234,7 +4324,7 @@ static void vk_eng_present(void* user, u32 surface)
           else if ((unsigned long long)u * 100u < (unsigned long long)bd * 78u) g_rsx_vram_tight = 0;
           if (was != g_rsx_vram_tight) VK_LOG("video memory %u MB of %u MB budget: shadow maps %s%c", u, bd,
                                               g_rsx_vram_tight ? "at the scene's scale for now" : "back to their own scale", 10);
-          if ((unsigned long long)u * 100u > (unsigned long long)bd * 95u && b0 - last_ev >= 5000000ull) {
+          if ((unsigned long long)u * 100u > (unsigned long long)bd * 84u && b0 - last_ev >= 1000000ull) {
               last_ev = b0; g_rsx_vram_pressure = 1; } } }
     {   /* Once a minute: how full the GPU's memory is (vk_vram_mb). */
         static unsigned long long last; unsigned u, b;
@@ -4487,6 +4577,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 color, u32 w, u32 h)
 static u32 vk_eng_depth_snapshot_sized(void* user, u32 depth, u32 w, u32 h, u32 tw, u32 th)
 {
     s_sync_calls[5]++;
+    { extern unsigned long long g_rsx_dsnap_cnt; g_rsx_dsnap_cnt++; }
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z) return 0;
     if (s_vk.eng_depth_format != VK_FORMAT_D32_SFLOAT && s_vk.eng_depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
@@ -5069,6 +5160,7 @@ static VkStencilOpState vk_gcm_stencil_face(u32 func, u32 fail, u32 zfail, u32 z
 /* RSX_ENG_STATS: shader translations / engine pipeline variants built, and
  * the render-thread time they took. */
 static unsigned long long s_vkt_spv, s_vkt_spv_us, s_vkt_var, s_vkt_var_us;
+unsigned long long g_rsx_spv_us, g_rsx_var_us, g_rsx_submit_us, g_rsx_dsnap_cnt;
 
 /* A SPIR-V program's name in pipelinelist.bin: FNV-1a over its words. */
 static u64 vk_spv_hash(const u32* w, u32 n)
@@ -5084,7 +5176,8 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out, u6
     const unsigned long long _t0 = ps3_qpc_us();
     s_vkt_spv++;
     const int bad = rsx_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log) || !words;
-    s_vkt_spv_us += ps3_qpc_us() - _t0;
+    { const unsigned long long _d = ps3_qpc_us() - _t0;
+      s_vkt_spv_us += _d; g_rsx_spv_us += _d; }
     if (bad) {
         VK_LOG("engine: %s translation failed: %s\n",
                stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
@@ -5785,7 +5878,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         const VkResult rc = vk_vdesc_build(&d, P->vs, P->fs, rp, &P->variant[topo_idx],
                                            VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT, s_g.pcache);
         if (rc == VK_SUCCESS && P->variant[topo_idx]) {
-            s_vkt_var++; s_vkt_var_us += ps3_qpc_us() - _t0;
+            const unsigned long long _d = ps3_qpc_us() - _t0;
+            s_vkt_var++; s_vkt_var_us += _d; g_rsx_var_us += _d;
             vk_plist_add(&d);
             return P->variant[topo_idx];
         }
@@ -5797,7 +5891,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         }
     }
     const VkResult r = vk_vdesc_build(&d, P->vs, P->fs, rp, &P->variant[topo_idx], 0, s_g.pcache);
-    s_vkt_var++; s_vkt_var_us += ps3_qpc_us() - _t0;
+    { const unsigned long long _d = ps3_qpc_us() - _t0;
+      s_vkt_var++; s_vkt_var_us += _d; g_rsx_var_us += _d; }
     s_g.pcache_dirty++;
     if (r != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
@@ -5851,11 +5946,8 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (s_bt.ready) {
         if (!s_e2.ps_shadow) s_e2.ps_shadow = (u8*)malloc(cap ? cap : 16);
         if (s_e2.ps_shadow) {
-            /* Small: compare first, so an unchanged block keeps its copy. */
-            if (bytes != s_e2.ps_bytes || memcmp(s_e2.ps_shadow, data, bytes)) {
-                memcpy(s_e2.ps_shadow, data, bytes);
-                s_e2.ps_dirty = 1;
-            }
+            memcpy(s_e2.ps_shadow, data, bytes);
+            s_e2.ps_dirty = 1;
         }
     } else memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
@@ -5865,7 +5957,10 @@ static void vk_eng_bind_textures(void* user, const u32* textures,
 {
     (void)user;
     if (mask != s_e2.tex_mask) s_e2.tex_dirty = 1;
-    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+    u32 active = mask | s_e2.tex_mask;
+    while (active) {
+        const u32 u = (u32)__builtin_ctz(active);
+        active &= active - 1u;
         const int on = (mask >> u) & 1u;
         const u32 t = on ? textures[u] : 0;
         if (t && t < VK_ENG_MAX_OBJ && s_eobj[t].lazy) (void)vk_eng_color_back(&s_eobj[t]);
@@ -6372,6 +6467,7 @@ static VkDescriptorSet vk_eng_set_for(vk_bt_slot* sl, u32 vsb, u32 psb)
 
 static int s_draw_geom_vi;        /* vk_eng_draw_cached_vi: the block holds vertices only */
 static int s_draw_vofs;           /* ... and the draw's base vertex */
+static u32 s_zpass_dbg_flags;
 static void vk_eng_draw_batched(VkPipeline pipe, VkRenderPass rp, VkFramebuffer fb, u32 w, u32 h,
                                 u32 n, const void* vertices, VkDeviceSize vbytes,
                                 const u32* indices, u32 index_count, u32 vertex_count, u32 geom)
@@ -6471,14 +6567,146 @@ static void vk_eng_draw_batched(VkPipeline pipe, VkRenderPass rp, VkFramebuffer 
             s_e2.bound_set = set; s_e2.bound_uvo = uvo; s_e2.bound_upo = upo;
         }
         pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &vo);
+        int zq = -1;
+        if (s_zpass_enabled && sl->zpass_pool) {
+            if (sl->zpass_used >= VK_ZPASS_QUERIES) {
+                static int olog;
+                if (olog < 8) { olog++; fprintf(stderr, "[zpass-ovf] zpass_used=%u >= %u\n", sl->zpass_used, VK_ZPASS_QUERIES); }
+            } else {
+                zq = (int)sl->zpass_used++;
+                sl->zpass_group[zq] = s_zpass_seq;
+                sl->zpass_idx[zq] = 0xFFFFFFFFu;
+                sl->zpass_dma[zq] = 0;
+                sl->zpass_off[zq] = 0;
+                sl->zpass_dbg[zq] = (w << 16) | (s_zpass_dbg_flags & 0xFFFFu);
+                sl->zpass_vc[zq] = index_count ? index_count : vertex_count;
+                pvkCmdBeginQuery(s_vk.cmd, sl->zpass_pool, (u32)zq, 0);
+            }
+        }
         if (ibytes) {
             pvkCmdBindIndexBuffer(s_vk.cmd, gidx ? s_geo_heap.buf : sl->arena.buf, io, VK_INDEX_TYPE_UINT32);
             pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, s_draw_geom_vi ? s_draw_vofs : 0, 0);
         } else {
             pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
         }
+        if (zq >= 0) pvkCmdEndQuery(s_vk.cmd, sl->zpass_pool, (u32)zq);
         return;
     }
+}
+
+void rsx_vk_zpass_set_enable(u32 enable) {
+    static int off = -1;
+    if (off < 0) { const char* e = getenv("RSX_ZPASS_OFF"); off = (e && *e && *e != '0') ? 1 : 0; }
+    s_zpass_enabled = (!off && enable) ? 1u : 0u;
+}
+void rsx_vk_zpass_poll(void)
+{
+    if (!s_bt.ready) return;
+    for (u32 i = 0; i < VK_BT_SLOTS; i++) {
+        vk_bt_slot* sl = &s_bt.s[i];
+        if (sl->submitted && (sl->zpass_used > 0 || sl->zpass_nlabels > 0)) {
+            if (pvkGetFenceStatus(s_vk.device, sl->fence) == VK_SUCCESS)
+                vk_bt_wait_slot(sl);
+        }
+    }
+}
+int rsx_vk_zpass_defer_label(u32 ea, u32 val)
+{
+    if (!s_bt.ready) return 0;
+    if (s_bt.recording && s_bt.s[s_bt.cur].zpass_used > 0) {
+        vk_bt_slot* sl = &s_bt.s[s_bt.cur];
+        if (sl->zpass_nlabels < 8u) {
+            sl->zpass_label_ea[sl->zpass_nlabels] = ea;
+            sl->zpass_label_val[sl->zpass_nlabels] = val;
+            sl->zpass_nlabels++;
+            vk_bt_submit(0, VK_NULL_HANDLE, VK_NULL_HANDLE);
+            return 1;
+        }
+        vk_bt_submit(1, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return 0;
+    }
+    for (u32 k = 1; k <= VK_BT_SLOTS; k++) {
+        vk_bt_slot* sl = &s_bt.s[(s_bt.cur + VK_BT_SLOTS - k) % VK_BT_SLOTS];
+        if (sl->submitted && sl->zpass_used > 0) {
+            if (pvkGetFenceStatus(s_vk.device, sl->fence) == VK_SUCCESS) {
+                vk_bt_wait_slot(sl);
+                continue;
+            }
+            if (sl->zpass_nlabels < 8u) {
+                sl->zpass_label_ea[sl->zpass_nlabels] = ea;
+                sl->zpass_label_val[sl->zpass_nlabels] = val;
+                sl->zpass_nlabels++;
+                return 1;
+            }
+            vk_bt_wait_slot(sl);
+            return 0;
+        }
+    }
+    return 0;
+}
+void rsx_vk_zpass_clear(u32 type)
+{
+    if (type == 0xFFFFFFFFu) {
+        if (s_bt.ready) {
+            extern unsigned long long g_rsx_zflush_us;
+            const unsigned long long zt0_ = ps3_qpc_us();
+            if (s_bt.recording && s_bt.s[s_bt.cur].zpass_used > 0)
+                vk_bt_submit(1, VK_NULL_HANDLE, VK_NULL_HANDLE);
+            else
+                for (u32 i = 0; i < VK_BT_SLOTS; i++)
+                    if (s_bt.s[i].submitted && s_bt.s[i].zpass_used > 0) vk_bt_wait_slot(&s_bt.s[i]);
+            g_rsx_zflush_us += ps3_qpc_us() - zt0_;
+        }
+        return;
+    }
+    if (type == 1u) s_zpass_seq++;
+}
+void rsx_vk_zpass_tag_report_ex(u32 idx, u32 dma, u32 off)
+{
+    int matched = 0;
+    if (s_bt.ready) {
+        int found = 0;
+        if (s_bt.recording) {
+            vk_bt_slot* sl = &s_bt.s[s_bt.cur];
+            for (u32 q = sl->zpass_used; q > 0; q--) {
+                if (sl->zpass_group[q - 1u] != s_zpass_seq) break;
+                sl->zpass_idx[q - 1u] = idx;
+                sl->zpass_dma[q - 1u] = dma;
+                sl->zpass_off[q - 1u] = off;
+                found = 1;
+                matched++;
+            }
+        }
+        if (!found) {
+            vk_bt_slot* prev = &s_bt.s[(s_bt.cur + VK_BT_SLOTS - 1u) % VK_BT_SLOTS];
+            for (u32 q = prev->zpass_used; q > 0; q--) {
+                if (prev->zpass_group[q - 1u] != s_zpass_seq) break;
+                prev->zpass_idx[q - 1u] = idx;
+                prev->zpass_dma[q - 1u] = dma;
+                prev->zpass_off[q - 1u] = off;
+                matched++;
+            }
+        }
+    }
+    if (!matched && dma) {
+        extern void cellGcm_write_report_async(u32 dma_report, u32 off, u32 val);
+        cellGcm_write_report_async(dma, off, 0xFFFFu);
+    }
+    s_zpass_seq++;
+}
+void rsx_vk_zpass_tag_report(u32 idx)
+{
+    rsx_vk_zpass_tag_report_ex(idx, 0u, 0u);
+}
+u32 rsx_vk_zpass_read_report(u32 idx)
+{
+    int s = zpass_find_slot(idx, 0);
+    return (s >= 0) ? __atomic_load_n(&s_zpass_map_val[s], __ATOMIC_RELAXED) : 0xFFFFu;
+}
+u32 rsx_vk_zpass_get_report(u32 idx)
+{
+    rsx_vk_zpass_tag_report(idx);
+    return rsx_vk_zpass_read_report(idx);
 }
 
 /* RSX_ENG_STATS=1: which way each engine draw left vk_eng_draw (printed with
@@ -6595,6 +6823,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
 
     const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
     VK_DRAW_EXIT(s_bt.ready ? 7 : 8);
+    s_zpass_dbg_flags = (P->rs.depth_test ? 1u : 0u) | (P->rs.depth_write ? 2u : 0u) |
+                        ((P->rs.depth_func & 0xFu) << 4) | (P->rs.cull_enable ? 0x100u : 0u) |
+                        ((dkey == 0xFFFFFFFFu) ? 0x200u : 0u) | ((P->rs.color_mask != 0) ? 0x400u : 0u) |
+                        ((P->rs.stencil_enable) ? 0x800u : 0u);
     if (s_bt.ready) { vk_eng_draw_batched(pipe, rp, fb, w, h, n, vertices, vbytes, indices, index_count, vertex_count, s_draw_geom); return; }
     if (vk_ensure_vertex_buffer(vbytes)) return;
     memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
@@ -6722,9 +6954,21 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * (the swapchain blit fits it to the window). */
     s_vk.guest_w = s_vk.width; s_vk.guest_h = s_vk.height;
     { const char* e = getenv("RACACIT_RES_SCALE");
-      float sc = e ? (float)atof(e) : 1.0f;
+      float sc = 1.0f;
+      if (!e || !*e || !SDL_strcasecmp(e, "auto")) {
+          int dw = 0, dh = 0;
+          if (s_vk.window) SDL_Vulkan_GetDrawableSize(s_vk.window, &dw, &dh);
+          if (dw > 0 && dh > 0 && s_vk.guest_w > 0 && s_vk.guest_h > 0) {
+              float sx = (float)dw / (float)s_vk.guest_w;
+              float sy = (float)dh / (float)s_vk.guest_h;
+              sc = sx < sy ? sx : sy;
+              sc = (float)((int)(sc * 100.0f + 0.5f)) / 100.0f;
+          }
+      } else {
+          sc = (float)atof(e);
+      }
       if (!(sc >= 0.25f)) sc = 1.0f;
-      if (sc > 4.0f) sc = 4.0f;
+      if (sc > 3.0f) sc = 3.0f;
       s_rs = sc;
       extern float rsx_fp_wpos_scale;
       rsx_fp_wpos_scale = sc;

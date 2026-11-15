@@ -1503,40 +1503,49 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     /* NOTE: cache getenv() -- this runs on every poll from multiple threads, and the
      * uncached version crashed deterministically (varying fault address = race). Every
      * other probe in this tree uses the cached `static int x=-1` pattern; match it. */
-    static int  s_inj   = -1;
-    static u16  s_btn   = 0x0008u;   /* default START */
-    static long s_delay = 3000;
+    static int    s_inj   = -1;
+    static u16    s_btn   = 0x0008u;   /* default START */
+    static long   s_delay = 3000;
+    static double s_stop  = 0.0;
+    static int    s_pf_yield = 0;
     if (s_inj < 0) {
         s_inj = getenv("YDKJ_INJECT_PAD") ? 1 : 0;
         const char* be = getenv("YDKJ_PAD_BTN");   if (be) s_btn   = (u16)strtoul(be,0,0);
         const char* de = getenv("YDKJ_PAD_DELAY"); if (de) s_delay = strtol(de,0,0);
+        const char* se = getenv("YDKJ_PAD_STOP");  if (se) s_stop  = atof(se);
     }
     /* Gate on WALL-CLOCK, not poll count: the game polls the pad hundreds of thousands
      * of times inside an early wait loop, so any count-based delay fires during init
      * (crash: guest ctr=0x0005F8A0 r3=0 -- button handler on an unconstructed object).
      * YDKJ_PAD_DELAY is now SECONDS to wait before the first injected press. */
-    if (s_inj && port_no < PAD_MAX_HOST_PORTS) {
-        static long _pc = 0; _pc++;
-        /* Cheap counter gate FIRST: clock() is a slow call and this poll loop is hammered
-         * by the guest from multiple threads; sampling it every poll perturbs timing. Only
-         * consult the clock once every 256 polls, and never after arming. */
+    if (s_inj && port_no == 0) {
         static int     s_armed = 0;
         static clock_t s_t0    = 0;
+        clock_t now = clock();
+        if (!s_t0) s_t0 = now;
+        double elapsed = (double)(now - s_t0) / (double)CLOCKS_PER_SEC;
         if (!s_armed) {
-            if ((_pc & 0xFF) == 0) {
-                if (!s_t0) s_t0 = clock();
-                else if ((double)(clock() - s_t0) / (double)CLOCKS_PER_SEC >= (double)s_delay) s_armed = 1;
+            if (elapsed >= (double)s_delay) {
+                s_armed = 1;
+                fprintf(stderr, "[cellPad] YDKJ_INJECT_PAD armed at %.2fs\n", elapsed);
             }
             goto skip_inject;
         }
-        u16 btn = s_btn; long delay = 0;
-        /* Delay past init, then a single clean pulse every ~180 calls (press 15, release 165). */
-        if (_pc > delay) {
-            long ph = (_pc - delay) % 180;
-            if (ph < 15) s_host_state[port_no].buttons |= btn;
-            else         s_host_state[port_no].buttons &= ~btn;
-            s_host_state[port_no].connected = 1;
+        if (s_pf_yield || (s_stop > 0.0 && elapsed >= s_stop)) {
+            s_host_state[port_no].buttons &= ~(0x6008u | s_btn);
+            goto skip_inject;
         }
+        /* Wall-clock 1s cycle: 0.25s press, 0.75s release, cycling START/CROSS/CIRCLE if 0x6008 */
+        double cyc = elapsed - (double)s_delay;
+        long slot = (long)(cyc / 1.0);
+        double in_slot = cyc - (double)slot * 1.0;
+        static const u16 k_seq[3] = { 0x0008u, 0x4000u, 0x2000u };
+        u16 b = (s_btn == 0x6008u) ? k_seq[slot % 3]
+              : (s_btn == 0x4008u || s_btn == 0x4800u) ? ((slot & 1) ? 0x4000u : 0x0008u)
+              : s_btn;
+        if (in_slot < 0.25) s_host_state[port_no].buttons |= b;
+        else                s_host_state[port_no].buttons &= ~(0x6008u | s_btn);
+        s_host_state[port_no].connected = 1;
     }
 skip_inject: ;
 
@@ -1692,6 +1701,7 @@ skip_inject: ;
                       unsigned m = 0; int n = 0;
                       const int got = sscanf(buf, "%i %i %i %i %i %i", (int*)&m, &n, &lx, &ly, &rx, &ry);
                       if (got >= 1 && (m || got >= 3)) {
+                          s_pf_yield = 1;
                           held_mask = m; held_n = n > 0 ? n : 40;
                           held_stick = got >= 3;
                           if (held_stick) { held_ax[0] = (unsigned char)lx; held_ax[1] = (unsigned char)ly;

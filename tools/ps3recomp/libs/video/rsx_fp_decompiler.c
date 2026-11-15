@@ -43,6 +43,7 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
+#define FP_SRC2_ABS         (1u << 18) /* in DWORD3 */
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
@@ -406,7 +407,7 @@ static const char* input_expr(u32 input_src)
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
                      int buffered, u32 constant_slot, char* buf, u32 bufsz)
 {
-    char base[96];
+    char base[256];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
@@ -422,7 +423,7 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
             snprintf(base, sizeof(base), "float4(0,0,0,0)");
     }
 
-    char swz[160];
+    char swz[320];
     snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
     const char* pre = "";
@@ -561,15 +562,6 @@ static int rsx_fp_decompile_internal(
      * Emitting the preamble here would mean guessing it. */
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
-    out_puts(&o,
-        "    float4 r[48]; float4 h[48];\n"
-        /* Fully initialise both register files: RSX programs routinely read a
-         * register lane before writing it (the hardware reads undefined), but
-         * HLSL rejects use-before-init (error X4000). Zero everything. */
-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
-        /* Condition-code registers for exec_if predication / set_cond. Reset
-         * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
-        "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
 
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
@@ -654,7 +646,7 @@ static int rsx_fp_decompile_internal(
         Src s0, s1, s2;
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
-        decode_src(w3, 0,                &s2);
+        decode_src(w3, w3 & FP_SRC2_ABS, &s2);
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -768,7 +760,7 @@ static int rsx_fp_decompile_internal(
          * part 4; two independent shader pairs confirmed). */
         case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt(abs((%s).x))", a); break;
         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
-        case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
+        case OP_LG2: snprintf(rhs, sizeof(rhs), "log2(max(abs((%s).x), 1e-10))", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
@@ -789,7 +781,7 @@ static int rsx_fp_decompile_internal(
                      a, a, b);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
-        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(rsx_nrm((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
         /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
          * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
@@ -1083,6 +1075,11 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
+    out_puts(&p,
+        "float3 rsx_nrm(float3 v) {\n"
+        "    float d = dot(v, v);\n"
+        "    return d > 1e-12 ? v * rsqrt(d) : float3(0.0, 0.0, 0.0);\n"
+        "}\n");
     if (rsx_fp_srgb_out)
         out_puts(&p,
             "float4 rsx_srgb_enc(float4 c) {\n"
@@ -1227,6 +1224,53 @@ static int rsx_fp_decompile_internal(
         if (depth_export) out_puts(&p, "    float d : SV_Depth;\n");
         out_puts(&p, "};\n"
                      "PSOutput main(PSInput input) {\n");
+    }
+    /* Size r[] and h[] to the highest index actually referenced in the body
+     * (plus exports in `wrote`), and omit cc0/cc1 when unreferenced. */
+    {
+        int max_r = -1, max_h = -1, has_cc0 = 0, has_cc1 = 0;
+        static const int exp_idx[FP_MAX_COLOR_TARGETS] = { 0, 2, 3, 4 };
+        for (u32 t = 0; t < FP_MAX_COLOR_TARGETS; t++) {
+            if (wrote[0][t] && exp_idx[t] > max_r) max_r = exp_idx[t];
+            if (wrote[1][t] && exp_idx[t] * 2 > max_h) max_h = exp_idx[t] * 2;
+        }
+        if (depth_export && 1 > max_r) max_r = 1;
+        for (size_t k = 0; k + 3 < o.len; k++) {
+            const char ch = out[k];
+            const char prev = k ? out[k - 1] : ' ';
+            const int id_start = !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+                                   (prev >= '0' && prev <= '9') || prev == '_');
+            if (!id_start) continue;
+            if ((ch == 'r' || ch == 'h') && out[k + 1] == '[' &&
+                out[k + 2] >= '0' && out[k + 2] <= '9') {
+                int idx = out[k + 2] - '0';
+                size_t q = k + 3;
+                if (out[q] >= '0' && out[q] <= '9') { idx = idx * 10 + (out[q] - '0'); q++; }
+                if (out[q] == ']' && idx < 48) {
+                    if (ch == 'r' && idx > max_r) max_r = idx;
+                    if (ch == 'h' && idx > max_h) max_h = idx;
+                }
+            } else if (ch == 'c' && out[k + 1] == 'c' && out[k + 3] != '_' &&
+                       !((out[k + 3] >= 'a' && out[k + 3] <= 'z') || (out[k + 3] >= '0' && out[k + 3] <= '9'))) {
+                if (out[k + 2] == '0') has_cc0 = 1;
+                else if (out[k + 2] == '1') has_cc1 = 1;
+            }
+        }
+        char reg_decl[256];
+        if (max_r >= 0) {
+            snprintf(reg_decl, sizeof reg_decl,
+                     "    float4 r[%d]; [unroll] for (int _ir = 0; _ir < %d; _ir++) r[_ir] = (float4)0;\n",
+                     max_r + 1, max_r + 1);
+            out_puts(&p, reg_decl);
+        }
+        if (max_h >= 0) {
+            snprintf(reg_decl, sizeof reg_decl,
+                     "    float4 h[%d]; [unroll] for (int _ih = 0; _ih < %d; _ih++) h[_ih] = (float4)0;\n",
+                     max_h + 1, max_h + 1);
+            out_puts(&p, reg_decl);
+        }
+        if (has_cc0) out_puts(&p, "    float4 cc0 = (float4)0;\n");
+        if (has_cc1) out_puts(&p, "    float4 cc1 = (float4)0;\n");
     }
 
     if (!o.ok || !p.ok) return -1;

@@ -168,6 +168,50 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* Hardware fence ordering: GET must acquire before subsequent LS reads;
+     * PUT must release prior LS stores before copying out to main memory. */
+    if (mfc_is_get(cmd))      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    else if (mfc_is_put(cmd)) __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    /* MFC_SDCRZ (0x89): Storage Data Cache Range Zero (no LS operand). */
+    if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
+        if (size == 0 || size > 0x4000 || (uint32_t)ea < 0x10000u || (ea >> 32) ||
+            !vm_base || !mfc_ea_range_committed(ea, size))
+            return -1;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        extern int  spu_coh_is_reserved(uint32_t);
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern void spu_lockline_lock(void);
+        extern void spu_lockline_unlock(void);
+        uint32_t a0 = (uint32_t)ea & ~127u;
+        uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+        int span_reserved = 0;
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (a == a1) break;
+        }
+        if (span_reserved) {
+            spu_lockline_lock();
+            memset(vm_base + (uint32_t)ea, 0, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (a == a1) break;
+            }
+            spu_lockline_unlock();
+        } else {
+            memset(vm_base + (uint32_t)ea, 0, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) {
+                    spu_lockline_lock();
+                    spu_coh_notify_write_except(a, spu);
+                    spu_lockline_unlock();
+                }
+                if (a == a1) break;
+            }
+        }
+        return 0;
+    }
+
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -643,6 +687,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           if (!g_spu_get_copy_hook ||
               !g_spu_get_copy_hook(spu, spu->ls, lsa, (uint32_t)ea, size, ls_ptr, ea_ptr))
               memcpy(ls_ptr, ea_ptr, size); }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -970,6 +1015,8 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
     return rc;
 }
 
+extern void spu_mfc_pending_pump(spu_context*);
+
 static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
                                         uint64_t ea_base, uint32_t list_size,
                                         uint32_t cmd)
@@ -977,9 +1024,17 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
-    return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
-                        spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
-                        spu->mfc_tag);
+    if (spu->mfc_list_pending)
+        spu_mfc_pending_pump(spu);   /* keep list issue order */
+    spu->mfc_list_pending  = 1;
+    spu->mfc_list_hold     = spu->steps;
+    spu->mfc_list_lsa      = list_lsa & SPU_LS_MASK;
+    spu->mfc_list_num      = num_elements;
+    spu->mfc_list_dest_lsa = spu->mfc_lsa & SPU_LS_MASK;
+    spu->mfc_list_ea_base  = ea_base;
+    spu->mfc_list_cmd      = base_cmd;
+    spu->mfc_list_tag      = spu->mfc_tag & 0x1F;
+    return 0;
 }
 
 /*
@@ -1581,7 +1636,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
-    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
+        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
 
     return rc;

@@ -597,7 +597,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * 401) feed the SPU synth from disc: starved on a 4-core PC they ran dry
      * and the music stuttered inside the game's own mix -- so the cut is 512.
      * ponytail: two host levels only; map the full range if a title needs it. */
-    if (priority < 512)
+    if (priority <= 512)
         SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
 #else
     /* Same reservation, for the same reason. This is the HOST stack the

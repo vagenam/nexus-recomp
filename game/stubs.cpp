@@ -485,51 +485,6 @@ extern "C" void racacit_luac_trace(ppu_context* ctx, const char* name)
  * RACACIT_KEEP_STALE_BOXES=1 turns it off.
  * -----------------------------------------------------------------------*/
 extern "C" void vm_write32(uint64_t a, uint32_t v);
-static inline float racacit_rdf(uint32_t ea) { uint32_t u = vm_read32(ea); float f; memcpy(&f, &u, 4); return f; }
-static inline void  racacit_wrf(uint32_t ea, float f) { uint32_t u; memcpy(&u, &f, 4); vm_write32(ea, u); }
-
-extern "C" void racacit_caster_box(uint32_t moby)
-{
-    static int off = -1;
-    if (off < 0) { const char* e = getenv("RACACIT_KEEP_STALE_BOXES"); off = (e && *e == '1') ? 1 : 0; }
-    if (off || !moby) return;
-    const float sx = racacit_rdf(moby + 0x70), sy = racacit_rdf(moby + 0x74),
-                sz = racacit_rdf(moby + 0x78), r = racacit_rdf(moby + 0x7C);
-    if (!(r > 0.0f) || r > 1.0e4f) return;
-    /* The camera rotation the bounds job uses (x y z w at 0x00F5D690). */
-    const float x = racacit_rdf(0x00F5D690), y = racacit_rdf(0x00F5D694),
-                z = racacit_rdf(0x00F5D698), w = racacit_rdf(0x00F5D69C);
-    const float n2 = x * x + y * y + z * z + w * w;
-    if (!(n2 > 0.98f && n2 < 1.02f)) return;
-    const float cx = (1 - 2 * (y * y + z * z)) * sx + 2 * (x * y - z * w) * sy + 2 * (x * z + y * w) * sz;
-    const float cy = 2 * (x * y + z * w) * sx + (1 - 2 * (x * x + z * z)) * sy + 2 * (y * z - x * w) * sz;
-    const float cz = 2 * (x * z - y * w) * sx + 2 * (y * z + x * w) * sy + (1 - 2 * (x * x + y * y)) * sz;
-    const float bx = 0.5f * (racacit_rdf(moby + 0xA0) + racacit_rdf(moby + 0xB0));
-    const float by = 0.5f * (racacit_rdf(moby + 0xA4) + racacit_rdf(moby + 0xB4));
-    const float bz = 0.5f * (racacit_rdf(moby + 0xA8) + racacit_rdf(moby + 0xB8));
-    const float dx = bx - cx, dy = by - cy, dz = bz - cz;
-    /* A box this function wrote and the game has not rewritten since is
-     * stale by definition: follow the sphere every frame. Waiting for a
-     * radius of drift (the old rule) let a moving caster leave its box
-     * behind -- the map is fitted to the box, so the part outside was cut
-     * off in a straight line and the shadow jumped back each rebuild: the
-     * owner's boxy shadows (worst on the moons' large static casters). */
-    enum { OWN = 256 };
-    static struct { uint32_t moby; float lo_x, hi_z; } own[OWN];
-    const uint32_t k = (moby >> 4) & (OWN - 1);
-    const int ours = own[k].moby == moby && own[k].lo_x == racacit_rdf(moby + 0xA0) && own[k].hi_z == racacit_rdf(moby + 0xB8);
-    if (!ours && dx * dx + dy * dy + dz * dz <= r * r) return;   /* the game's current box */
-    /* RACACIT_CASTER_LOG=1: each rebuild, with the box the game had (size) and the cube it gets. */
-    { static int lg = -1; if (lg < 0) { const char* e = getenv("RACACIT_CASTER_LOG"); lg = (e && *e == '1') ? 1 : 0; }
-      static unsigned n; if (lg && !ours && n < 400) { n++;
-        fprintf(stderr, "[caster-box] moby 0x%08X r=%.1f old %.1fx%.1fx%.1f at (%.1f %.1f %.1f) -> cube %.1f at (%.1f %.1f %.1f)%c",
-                moby, r, racacit_rdf(moby + 0xB0) - racacit_rdf(moby + 0xA0), racacit_rdf(moby + 0xB4) - racacit_rdf(moby + 0xA4),
-                racacit_rdf(moby + 0xB8) - racacit_rdf(moby + 0xA8), bx, by, bz, 2 * r, cx, cy, cz, 10); } }
-    racacit_wrf(moby + 0xA0, cx - r); racacit_wrf(moby + 0xA4, cy - r); racacit_wrf(moby + 0xA8, cz - r);
-    racacit_wrf(moby + 0xB0, cx + r); racacit_wrf(moby + 0xB4, cy + r); racacit_wrf(moby + 0xB8, cz + r);
-    own[k].moby = moby; own[k].lo_x = racacit_rdf(moby + 0xA0); own[k].hi_z = racacit_rdf(moby + 0xB8);
-}
-
 /* ---------------------------------------------------------------------------
  * Start skips any pre-rendered movie (RACACIT_START_SKIPS_MOVIES, default on)
  *
@@ -607,12 +562,7 @@ extern "C" uint32_t racacit_movie_update_hook(uint32_t slot, uint32_t playing)
     if (!bink || vm_read8(slot + 9)) return playing;          /* no movie / looping */
     MovieRec* m = movie_find(bink);
     if (!m || !m->skippable) return playing;
-    /* RACACIT_AUTOSKIP_MOVIES=1 (test drivers): every skippable movie ends on
-     * its first frame, no START needed -- the test scripts do not sit through
-     * cutscenes. Off by default; players skip with START. */
-    static int s_auto = -1;
-    if (s_auto < 0) { const char* e = getenv("RACACIT_AUTOSKIP_MOVIES"); s_auto = (e && *e == '1') ? 1 : 0; }
-    if (!s_auto && !ps3_pad_take_start_press()) return playing;
+    if (!ps3_pad_take_start_press()) return playing;
     fprintf(stderr, "[movie] START: skipping %s\n", m->name);
     m->bink = 0;
     return 0;
@@ -810,66 +760,6 @@ static void racacit_guest_drain(ppu_context* ctx)
 
 /* At loc_004A4DB4, after the list's loop: r23 = the game's entries, r30 = the
  * menu's pool, sp+0x80 = skinSelected (undefined or a number), set just after. */
-extern "C" void racacit_skin_armor_selected(ppu_context* ctx)
-{
-    s_skin_rows = (uint32_t)ctx->gpr[23];
-    const int look = racacit_armor_look_now();
-    if (!look) return;
-    const uint32_t G = vm_read32((uint32_t)ctx->gpr[30] - 0x7FD8u);   /* the player record */
-    if (!G || vm_read32(G + 0x5F0u) != 0) return;   /* a skin is worn: it shows, and the list marks it */
-    const double sel = (double)(s_skin_rows + (uint32_t)look - 1u);
-    uint64_t bits; memcpy(&bits, &sel, 8);
-    const uint32_t sp = (uint32_t)ctx->gpr[1];
-    vm_write32(sp + 0x80u, 3u);   /* a number */
-    vm_write64(sp + 0x88u, bits);
-}
-
-/* After the list's last array: r27 = the movie, r30 = the menu's pool. The
- * entries sit below the guest stack pointer during the calls, and every
- * register is put back after them. */
-extern "C" void racacit_skin_armor_rows(ppu_context* ctx)
-{
-    const uint32_t pool = (uint32_t)ctx->gpr[30], movie = (uint32_t)ctx->gpr[27], first = s_skin_rows;
-    if (!movie || first > 64u) return;
-    uint64_t gpr[32], lr = ctx->lr, ctr = ctx->ctr; double fpr[32]; u128 vr[32];
-    const uint32_t cr = ctx->cr, xer = ctx->xer, fpscr = ctx->fpscr, vscr = ctx->vscr;
-    memcpy(gpr, ctx->gpr, sizeof gpr); memcpy(fpr, ctx->fpr, sizeof fpr); memcpy(vr, ctx->vr, sizeof vr);
-    const uint32_t sp = (uint32_t)ctx->gpr[1], nsp = (sp - 0x400u) & ~15u, data = nsp + 0x100u;
-    vm_write32(nsp, 0); vm_write32(nsp + 4u, sp);   /* back chain */
-
-    const uint32_t table = vm_read32(pool - 0x7F18u);   /* 0xDF07E0 */
-    uint32_t name[4];
-    for (uint32_t i = 0; i < 4; i++) {
-        uint32_t tag = table ? vm_read32(table + 0x320u + (i + 1u) * 0x14u + 4u) : 0u;
-        if (!tag) tag = 0xBAu + i;   /* "Holoflux Armor" .. "Hyperflux Armor" */
-        ctx->gpr[1] = nsp; ctx->gpr[3] = tag; ctx->gpr[4] = 0; ctx->lr = 0x004A4EE8u;
-        func_00937A90(ctx); racacit_guest_drain(ctx);
-        const uint32_t t = (uint32_t)ctx->gpr[3];
-        name[i] = t ? vm_read32(t + 8u) : vm_read32(pool - 0x7F14u);
-    }
-    /* skinNames, skinDescs, skinGB, skinUnlocked, skinImages, skinValues */
-    static const uint32_t var[6] = { 0x7E60u, 0x7E5Cu, 0x7E58u, 0x7E54u, 0x7E50u, 0x7E4Cu };
-    for (uint32_t a = 0; a < 6; a++) {
-        const uint32_t arr = data + a * 0x40u;
-        for (uint32_t i = 0; i < 4; i++) {
-            const uint32_t v = arr + i * 16u;   /* GFx value: +0 type, +8 the value */
-            for (uint32_t k = 0; k < 16u; k += 4u) vm_write32(v + k, 0);
-            if (a <= 1) { vm_write32(v, 4u); vm_write32(v + 8u, name[i]); continue; }   /* a string */
-            if (a == 3) { vm_write32(v, 2u); vm_write8(v + 8u, 1); continue; }         /* true */
-            static const uint32_t picture[4] = { 71u, 79u, 81u, 80u };   /* Holoflux .. Hyperflux */
-            const double num = a == 4 ? (double)picture[i] : a == 5 ? (double)(101u + i) : 0.0;
-            uint64_t bits; memcpy(&bits, &num, 8);
-            vm_write32(v, 3u); vm_write64(v + 8u, bits);   /* a number */
-        }
-        ctx->gpr[1] = nsp; ctx->gpr[3] = movie; ctx->gpr[4] = vm_read32(pool - var[a]); ctx->gpr[5] = first;
-        ctx->gpr[6] = arr; ctx->gpr[7] = 4; ctx->gpr[8] = 1; ctx->lr = 0x004A4EE8u;
-        func_0095D30C(ctx); racacit_guest_drain(ctx);
-    }
-
-    memcpy(ctx->gpr, gpr, sizeof gpr); memcpy(ctx->fpr, fpr, sizeof fpr); memcpy(ctx->vr, vr, sizeof vr);
-    ctx->cr = cr; ctx->lr = lr; ctx->ctr = ctr; ctx->xer = xer; ctx->fpscr = fpscr; ctx->vscr = vscr;
-}
-
 /* EquipSkin's value (func_004A27F8): the game then equips it if it is unlocked. */
 extern "C" uint32_t racacit_equip_skin(uint32_t skin)
 {
@@ -1107,6 +997,8 @@ static void racacit_collrec_write(uint32_t ea)
 
 __attribute__((constructor)) static void racacit_collrec_install(void)
 {
+    const char* e = getenv("RACACIT_COLLREC");
+    if (!e || strcmp(e, "1") != 0) return;
     g_coh_write_hook    = racacit_collrec_write;
     g_spu_get_copy_hook = racacit_collrec_get;
     g_spu_put_skip_hook = racacit_collrec_put;
@@ -1218,27 +1110,10 @@ static void racacit_lua_file(ppu_context* ctx, uint32_t L)
 extern "C" void racacit_wait_begin(ppu_context* ctx)
 {
     racacit_spu_kick();
-    /* The main game thread's context, for the stall watch (main.cpp): it is
-     * the one that waits on MobyPreRender every frame. */
-    if ((uint32_t)ctx->lr == 0x006459D0u) { g_racacit_main_ctx = ctx; racacit_lua_file(ctx, s_lua_main); }
-    if (!rac_wait_stats()) return;
+    if (!rac_wait_stats()) { (void)ctx; return; }
     if (t_wait_depth++ == 0) {
         t_wait_t0 = rac_us(); t_wait_lr = (uint32_t)ctx->lr;
-        /* func_00929FFC (resolve a handle and wait until its object is
-         * ready) has dozens of callers: key on its caller, whose return
-         * address it saved at its frame + 0x90. */
-        if (t_wait_lr == 0x0092A018u) t_wait_lr = vm_read32((uint32_t)ctx->gpr[1] + 0x94u);
-        /* ...and func_004E7D60 is a one-line wrapper of it: its caller. */
-        if (t_wait_lr == 0x004E7D70u) t_wait_lr = vm_read32((uint32_t)ctx->gpr[1] + 0x80u + 0x94u);
         g_racacit_main_wait_lr = t_wait_lr;   /* PS3_SAMPLE_INWAIT */
-        /* RACACIT_SPIN_WATCH=1: for the 6 ms-a-frame wait in func_002A7E88,
-         * who sets the object's ready bit (halfword +0x18). */
-        static int sw = -1; if (sw < 0) sw = getenv("RACACIT_SPIN_WATCH") ? 1 : 0;
-        if (sw && t_wait_lr == 0x002A7F1Cu) {
-            g_racacit_watch_img = -1;
-            t_watch_obj = (uint32_t)ctx->gpr[3];
-            g_racacit_watch_ea = t_watch_obj + 0x18u;
-        }
     }
 }
 
@@ -1499,7 +1374,7 @@ static void racacit_dsw_event(const char* name)
     static signed char fam[256];
     static int init = 0; static uint32_t last_id = 0xFFFFFFFFu;
     if (!init) { init = 1; memset(fam, -1, sizeof fam); fam[17] = DSW_THROW; fam[16] = DSW_LIGHT; fam[5] = DSW_HEAVY; }
-    const uint32_t id = vm_read32(0x00E24E78u);
+    const uint32_t id = 0u;   /* 0x00E24E78 is ACiT-specific */
     if (id != last_id) { last_id = id; racacit_ds_weapon_profile(id < 256 && fam[id] >= 0 ? fam[id] : DSW_MEDIUM); }
     if (!strncmp(name, "veh_aphelion_fire", 17)) {                  /* the ship: blasters on the fire trigger */
         static int ship = 0; if (!ship) { ship = 1; racacit_ds_weapon_profile(DSW_LIGHT); }
@@ -1617,7 +1492,7 @@ extern "C" void racacit_snd_play_hook(ppu_context* ctx, int tag)
              * the controller shows up as "stays on the TV". */
             const unsigned long long f = g_racacit_fire_ms, now = ps3_qpc_us() / 1000ull;
             if (f && now - f < 60ull && name[0] && strncmp(name, "amb_", 4) && strncmp(name, "ui_", 3) && strncmp(name, "cha_", 4)) {
-                const uint32_t wid = vm_read32(0x00E24E78u);
+                const uint32_t wid = 0u;   /* 0x00E24E78 is ACiT-specific */
                 static uint32_t said[256]; static unsigned ns; static volatile long mg;
                 uint32_t h = wid * 2654435761u; for (const char* q = name; *q; q++) h = h * 31u + (uint8_t)*q;
                 while (__sync_lock_test_and_set(&mg, 1)) { }
@@ -1644,7 +1519,7 @@ extern "C" void racacit_snd_play_hook(ppu_context* ctx, int tag)
               if (!dup) fprintf(stderr, "[ds-name] %s%s%c", name, t_ds_cat ? "  (routed)" : "", 10);
           } }
         if (!strncmp(name, "wep_", 4) || !strncmp(name, "mag_net_", 8) || !strncmp(name, "sub_new_", 8)) {   /* which weapon makes which sounds */
-            const uint32_t wid = vm_read32(0x00E24E78u);   /* equipped weapon id (A Crack in Time) */
+            const uint32_t wid = 0u;   /* 0x00E24E78 (A Crack in Time) disabled on Nexus */
             static uint32_t said[512]; static unsigned ns; static volatile long mw;
             uint32_t h = wid * 2654435761u; for (const char* q = name; *q; q++) h = h * 31u + (uint8_t)*q;
             while (__sync_lock_test_and_set(&mw, 1)) { }

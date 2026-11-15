@@ -1,9 +1,19 @@
 # Build directories & binaries
 build-win/
+build-win-clang-pgo/
+*.profdata
+*.profraw
 dist/
+RecompFolder/
 out/
 scratch/
 __pycache__/
+tools/.portable/
+release/
+Put_Game_Folder_Here/*
+!Put_Game_Folder_Here/README.txt
+Put_ELF_Here/*
+!Put_ELF_Here/README.txt
 *.exe
 *.dll
 *.pdb
@@ -13,6 +23,8 @@ __pycache__/
 *.lib
 
 # Game files & dumps
+game/src/recomp/
+game/spu/
 elf/
 *.ELF
 *.elf

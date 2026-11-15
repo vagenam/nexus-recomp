@@ -46,9 +46,11 @@ typedef struct rsx_host_options {
     int   sharpness;      /* 0..10 (sharp upscaling only)                      */
     int   brightness;     /* -5..+5, 0 = as the game draws it                  */
     float res_scale;      /* internal resolution asked for (applies at start)  */
+    int   shadow_res;     /* shadow map resolution scale 1..4 (applies at start) */
     int   aniso;          /* 0 (off), 2, 4, 8, 16                              */
     int   trilinear;      /* 0 / 1                                             */
     int   fps;            /* 0 off, 1 FPS counter                              */
+    int   fps_limit;      /* 0 (unlimited), 30, 60, 120                        */
     int   discord;        /* 1: Discord status on (when the build has an app) */
     int   skip_clank;     /* 1: a load into a Great Clock (Clank) level goes on to the next level (testing) */
     int   armor_look;     /* 0: the armor worn; 1-4: Holoflux..Hyperflux's look, the worn armor's protection -- picked in the game's Skins menu (game/stubs.cpp) */
@@ -69,7 +71,6 @@ typedef struct rsx_host_options {
                            * rsx_host_ui_options() then reads ds_speaker, ds_haptics, ds_triggers,
                            * ds_swap, ds_lightbar and ds_motion as 0; the stored values stay. */
     int   tex_quality;    /* 0 high (as shipped), 1 medium, 2 low: top mip levels left out (applies at start) */
-    int   cpu_mode;       /* 0 efficient (SPU lanes sleep after a short spin), 1 maximum (they spin) */
     int   present_pace;   /* 1: presents held to an even 60 Hz (rsx_be_proxy.c) */
     int   kbm;            /* 1: keyboard and mouse play (cellPad.c)            */
     int   mouse_sens;     /* mouse camera speed, percent (100 = default)       */

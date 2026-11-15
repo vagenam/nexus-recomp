@@ -15,6 +15,9 @@
 #include "spu_dma.h"
 #if defined(__SSE__) || defined(_M_X64) || defined(__x86_64__)
 #include <xmmintrin.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #define SPU_CSR_GET() ((unsigned long long)_mm_getcsr())
 #define SPU_CSR_SET(v) _mm_setcsr((unsigned)(v))
 #define SPU_CSR_SPU(v) ((v) | 0xE040u)                 /* DAZ, FTZ, round toward zero */
@@ -49,12 +52,21 @@ static inline int spu_mem_ne(const void* a, const void* b, size_t n)
 {
     const unsigned char* p = (const unsigned char*)a;
     const unsigned char* q = (const unsigned char*)b;
+#if defined(__AVX2__)
+    while (n >= 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)p);
+        __m256i vb = _mm256_loadu_si256((const __m256i*)q);
+        if ((uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) != 0xFFFFFFFFu) return 1;
+        p += 32; q += 32; n -= 32;
+    }
+#else
     while (n >= 32) {
         uint64_t x[4], y[4];
         memcpy(x, p, 32); memcpy(y, q, 32);
         if ((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) return 1;
         p += 32; q += 32; n -= 32;
     }
+#endif
     while (n >= 8) {
         uint64_t x, y; memcpy(&x, p, 8); memcpy(&y, q, 8);
         if (x != y) return 1;
@@ -88,11 +100,10 @@ static uint64_t spu_host_ns(void)
     LARGE_INTEGER c;
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     QueryPerformanceCounter(&c);
-    /* Split the divide to keep the multiply from overflowing: QPC counters are
-     * large enough that (count * 1e9) wraps a u64 within hours of uptime. */
-    return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
-         + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
-           / (uint64_t)s_freq.QuadPart;
+    if (s_freq.QuadPart == 10000000LL)
+        return (uint64_t)c.QuadPart * 100ull;
+    return (uint64_t)(((__uint128_t)(uint64_t)c.QuadPart * 1000000000ull)
+                      / (uint64_t)s_freq.QuadPart);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -351,52 +362,88 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  *     stored both took the same slot and then shared one engine's queue and tag
  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
-
-typedef struct {
-    spu_context* volatile ctx;
-    mfc_engine   mfc;
+typedef struct spu_mfc_slot {
+    spu_context*         ctx;
+    mfc_engine           mfc;
+    struct spu_mfc_slot* next;
 } spu_mfc_slot;
 
-static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
-static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+static spu_mfc_slot* s_mfc_slots = NULL;
+static SRWLOCK       s_mfc_claim_lock = SRWLOCK_INIT;
+static volatile long s_mfc_gen = 0;
+
+static SPU_TLS spu_context* t_mfc_ctx = NULL;
+static SPU_TLS mfc_engine*  t_mfc_engine = NULL;
+static SPU_TLS long         t_mfc_gen = -1;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
+    long gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
+    if (t_mfc_ctx == ctx && t_mfc_gen == gen && t_mfc_engine)
+        return t_mfc_engine;
 
-    /* No slot yet: take one. The engine is initialized before the slot is
-     * published, so it is never visible to anyone in a half-reset state. */
-    mfc_engine* e = NULL;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
-        if (s_mfc_slots[i].ctx != NULL) continue;
-        mfc_engine_init(&s_mfc_slots[i].mfc);
-        s_mfc_slots[i].ctx = ctx;
-        e = &s_mfc_slots[i].mfc;
-    }
-    if (!e) {
-        /* Out of slots: fall back to a shared engine (correct for single-SPU).
-         * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
-         * the same time, which is more SPUs than the machine has -- and the
-         * sharing is silent, so say it once. Its one-time init is inside the
-         * lock as well, or two threads arriving together would each memset an
-         * engine the other is already using. */
-        static mfc_engine fallback;
-        static int fallback_init = 0;
-        if (!fallback_init) {
-            mfc_engine_init(&fallback);
-            fallback_init = 1;
-            fprintf(stderr, "[SPU] more than %d contexts hold an MFC engine at "
-                    "once; the rest share one\n", SPU_MAX_CONTEXTS);
-            fflush(stderr);
+    AcquireSRWLockShared(&s_mfc_claim_lock);
+    gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
+    for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next) {
+        if (s->ctx == ctx) {
+            mfc_engine* e = &s->mfc;
+            ReleaseSRWLockShared(&s_mfc_claim_lock);
+            t_mfc_ctx = ctx;
+            t_mfc_engine = e;
+            t_mfc_gen = gen;
+            return e;
         }
-        e = &fallback;
     }
+    ReleaseSRWLockShared(&s_mfc_claim_lock);
+
+    /* Allocate and initialize before inserting so the list never exposes a
+     * half-reset engine. */
+    spu_mfc_slot* node = (spu_mfc_slot*)calloc(1, sizeof(spu_mfc_slot));
+    mfc_engine_init(&node->mfc);
+    node->ctx = ctx;
+
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next) {
+        if (s->ctx == ctx) {
+            mfc_engine* e = &s->mfc;
+            gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
+            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+            free(node);
+            t_mfc_ctx = ctx;
+            t_mfc_engine = e;
+            t_mfc_gen = gen;
+            return e;
+        }
+    }
+    node->next = s_mfc_slots;
+    s_mfc_slots = node;
+    gen = __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE);
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-    return e;
+
+    t_mfc_ctx = ctx;
+    t_mfc_engine = &node->mfc;
+    t_mfc_gen = gen;
+    return &node->mfc;
+}
+
+/* Async MFC list pump: executes the list queued by mfc_do_list_transfer
+ * (spu_dma.h). Called from the drain path (SPU_DRAIN macro / spu_drain)
+ * AFTER the SPU has executed past the issuing wrch but BEFORE the interrupt
+ * check, so a stall-and-notify raised here is seen by the same drain -- the
+ * arming code has already run, matching hardware ordering. */
+void spu_mfc_pending_pump(spu_context* spu)
+{
+    if (!spu->mfc_list_pending) return;
+    spu->mfc_list_pending = 0;
+    mfc_engine* mfc = mfc_for(spu);
+    uint32_t t = spu->mfc_list_tag & 0x1F;
+    int rc = mfc_run_list(spu, spu->mfc_list_lsa, spu->mfc_list_num,
+                          spu->mfc_list_dest_lsa, spu->mfc_list_ea_base,
+                          spu->mfc_list_cmd, spu->mfc_list_tag);
+    /* Full drain with no (re)park: complete the tag, as mfc_submit does for
+     * inline transfers. A parked list completes later via WrListStallAck. */
+    if (rc == 0 && !(spu->list_stall_mask & (1u << t)))
+        mfc->tag_completed |= (1u << t);
 }
 
 /* Give the slot `ctx` holds back to the table, called when its context is done.
@@ -412,10 +459,22 @@ void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx != ctx) continue;
-        s_mfc_slots[i].ctx = NULL;
-        break;
+    spu_mfc_slot** pp = &s_mfc_slots;
+    while (*pp) {
+        spu_mfc_slot* cur = *pp;
+        if (cur->ctx == ctx) {
+            *pp = cur->next;
+            __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
+            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+            free(cur);
+            if (t_mfc_ctx == ctx) {
+                t_mfc_ctx = NULL;
+                t_mfc_engine = NULL;
+                t_mfc_gen = -1;
+            }
+            return;
+        }
+        pp = &cur->next;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
@@ -550,15 +609,16 @@ found:
      * slice) see sub-microsecond latency instead of a 50-100 us timer sleep;
      * on a small host the waiting thread must step aside for the one it is
      * waiting on. */
-    static int s_spin = 0, s_yield = 0;
+    static int s_spin = 0, s_yield = 0, s_many_cpus = 0;
     if (!s_spin) {
 #ifdef _WIN32
         SYSTEM_INFO si; GetSystemInfo(&si); long ncpu = (long)si.dwNumberOfProcessors;
 #else
         long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-        s_spin  = ncpu >= 8 ? 20000 : 256;
-        s_yield = ncpu >= 8 ? 40000 : 1024;
+        s_many_cpus = (ncpu >= 16);
+        s_spin  = (ncpu >= 8) ? 4096 : 256;
+        s_yield = (ncpu >= 8) ? 65536 : 1024;
     }
     if (++t_idle < (unsigned)s_spin) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -566,7 +626,7 @@ found:
 #endif
         return;
     }
-    if (t_idle < (unsigned)s_yield) {
+    if (s_many_cpus || t_idle < (unsigned)s_yield) {
 #ifdef _WIN32
         SwitchToThread();
 #else
@@ -1103,6 +1163,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
+        if (channel == MFC_WrTagUpdate && ctx->mfc_list_pending)
+            spu_mfc_pending_pump(ctx);
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
@@ -1270,11 +1332,16 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
+        const int resv_poll = (channel == SPU_RdEventStat && (ctx->event_mask & 0x400u) && ctx->resv_valid);
+        if (resv_poll) {
+            for (int s = 0; s < 64 && !spu_ch_ready(ctx, channel); s++)
+                YieldProcessor();
+        }
         while (!spu_ch_ready(ctx, channel)) {
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel))
                 SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+                                          (SRWLOCK*)&ctx->ch_wait_lock, resv_poll ? 1u : 10u, 0);
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb) {
@@ -1342,12 +1409,10 @@ volatile int g_racacit_spu_spin_us = 30;
 static void spu_lr_wait(spu_context* ctx)
 {
     static long s_us = -1;
-    /* 200 us: a SPURS kernel parked here re-polls its workloads at least
-     * that often. A Crack in Time posts job-chain work through stores that
-     * reach the line without a lock-line notify; at the old 2 ms bound the
-     * job sat that long before an SPU picked it up, while the main thread
-     * spun on its completion (Zolar: 86% -> 93% of frames on time). */
-    if (s_us < 0) { const char* e = getenv("SPU_LR_WAIT_US"); s_us = e ? atol(e) : 200; }
+    /* 100 us: a SPURS kernel parked here re-polls its workloads at least
+     * that often. A Crack in Time / Into the Nexus posts job-chain work
+     * through stores that reach the line without a lock-line notify. */
+    if (s_us < 0) { const char* e = getenv("SPU_LR_WAIT_US"); s_us = e ? atol(e) : 100; }
     if (s_us <= 0 || !(ctx->event_mask & 0x400u)) return;
     if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) return;
     LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
@@ -1375,16 +1440,23 @@ extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU
      * that does not notify: up to 1 ms late), or at the bound. */
     static int s_st = -1; if (s_st < 0) s_st = getenv("SPU_LR_STATS") ? 1 : 0;
     static volatile long s_n[4]; static unsigned long long s_last;
+    static _Thread_local uint32_t t_last_ea;
+    static _Thread_local unsigned t_lr_timeouts;
+    const uint32_t cur_ea = ctx->resv_ea & ~127u;
     int slept = 0;
 #define SPU_LR_STAT(k) do { if (s_st) { InterlockedIncrement(&s_n[k]); const unsigned long long n_ = ps3_qpc_us();         if (!s_last) s_last = n_; else if (n_ - s_last > 5000000ull) { s_last = n_;         fprintf(stderr, "[lr-wait] spin %ld notified %ld polled-late %ld bound %ld%c", s_n[0], s_n[1], s_n[2], s_n[3], 10);         s_n[0] = s_n[1] = s_n[2] = s_n[3] = 0; } } } while (0)
     for (;;) {
         if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) {
+            t_lr_timeouts = 0;
             SPU_LR_STAT(slept ? 1 : 0); SPU_LR_WAIT_DONE(); return; }
         spu_resv_lost_poll(ctx);
         if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) {
+            t_lr_timeouts = 0;
             SPU_LR_STAT(slept ? 2 : 0); SPU_LR_WAIT_DONE(); return; }
         QueryPerformanceCounter(&t);
         if (t.QuadPart - t0.QuadPart >= lim) {
+            if (cur_ea == t_last_ea) { if (t_lr_timeouts < 1000) t_lr_timeouts++; }
+            else { t_last_ea = cur_ea; t_lr_timeouts = 1; }
             SPU_LR_STAT(3); SPU_LR_WAIT_DONE();
             /* SPU_LR_STATS: which lines the waits that time out are on. */
             if (s_st) { static uint32_t ea_[16]; static unsigned long cnt_[16]; static unsigned long tot_;
@@ -1397,7 +1469,30 @@ extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU
                     fprintf(stderr, " (img %d pc 0x%05X)%c", ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), 10);
                 } }
             return; }
-        if (t.QuadPart - t0.QuadPart < spin) { YieldProcessor(); continue; }
+        if (t.QuadPart - t0.QuadPart < spin) {
+            for (int _s = 0; _s < 16; _s++) {
+                if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) break;
+                YieldProcessor();
+            }
+            continue;
+        }
+        /* Both SleepConditionVariableSRW(..., 1, 0) and CreateWaitableTimerExW
+         * have >=0.5-1 ms scheduler granularity on Windows, which turns a 100 us
+         * SPU_LR_WAIT_US bound into a 0.5-1 ms kernel sleep whenever PPU writes
+         * to the line without calling spu_ch_wake (and prevents spu_resv_lost_poll
+         * from running during that sleep). For sub-millisecond bounds, yield with
+         * SwitchToThread() so spu_resv_lost_poll() checks the line every ~1 us
+         * and exits sharply at the 100 us bound. */
+        if (lim < f.QuadPart / 1000 && t_lr_timeouts < 4) {
+            for (int _s = 0; _s < 32; _s++) {
+                if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) break;
+                YieldProcessor();
+            }
+            if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) continue;
+            SwitchToThread();
+            slept = 1;
+            continue;
+        }
         yz_lockstep_block_begin(ctx);
         AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
         if (!(ctx->event_status & ctx->event_mask) && ctx->resv_valid)
@@ -1414,6 +1509,20 @@ extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+#ifdef _WIN32
+    if (channel == SPU_RdDec) {
+        static int s_c_dec = -1, s_t_dec = -1;
+        if (s_c_dec < 0) s_c_dec = getenv("SPU_CHHIST") ? 1 : 0;
+        if (s_t_dec < 0) s_t_dec = getenv("SPU_POLLTRACE") ? 1 : 0;
+        if (!s_c_dec && !s_t_dec) {
+            uint64_t now = spu_host_ns();
+            if (!ctx->dec_base_ns) ctx->dec_base_ns = now;
+            uint64_t elapsed = now - ctx->dec_base_ns;
+            uint32_t ticks = (uint32_t)(((__uint128_t)elapsed * SPU_DECREMENTER_HZ) / 1000000000ull);
+            return spu_make_preferred_u32(ctx->decrementer - ticks);
+        }
+    }
+#endif
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1447,6 +1556,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
+        if (channel == MFC_RdTagStat && ctx->mfc_list_pending)
+            spu_mfc_pending_pump(ctx);
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
         return spu_make_preferred_u32(v);
     }
@@ -1486,7 +1597,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
-    case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
+    case SPU_RdMachStat:    v = ctx->int_enable ? 1u : 0u; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
         v = 0;
@@ -1975,20 +2086,33 @@ void spu_lookup_explain(const spu_context* ctx, uint32_t addr)
     fprintf(stderr, "%c", 10);
 }
 
+typedef struct {
+    uint32_t addr;
+    uint32_t delta;
+    uint32_t base;
+    const spu_reg_entry* e;
+} spu_ovl_cache_slot;
+static _Thread_local spu_ovl_cache_slot t_spu_ovl_cache[64];
+
 static spu_fn spu_lookup_fixed(const spu_context* ctx, uint32_t addr, int image_id)
 {
+    const int have_hdr = (ctx && addr + 8 <= SPU_LS_SIZE);
+    uint32_t w0 = 0, w1 = 0;
+    const uint8_t* q = NULL;
+    if (have_hdr) {
+        q = ctx->ls + addr;
+        w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+    }
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         spu_reg_entry* e = &s_registry[n - 1];
         if (e->addr != addr) continue;
         if (e->ovl) {
             /* Overlay entry: matched by content, whatever the context's image. */
-            if (!ctx || addr + 8 > SPU_LS_SIZE) continue;
+            if (!have_hdr) continue;
+            if (w0 != e->sig0 || w1 != e->sig1) continue;
             const spu_ovl_desc* o = &s_ovl[e->ovl - 1];
             if (spu_mem_ne(ctx->ls + o->base + o->anchor, o->guid, 16) != 0) continue;
-            const uint8_t* q = ctx->ls + addr;
-            uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
-            uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
-            if (w0 != e->sig0 || w1 != e->sig1) continue;
             /* The whole body, not just its first two words: a job may patch
              * a module after loading it (A Crack in Time's job 4360b202 does,
              * at 0x29C00), and serving the unpatched lift fed that job garbage
@@ -2009,13 +2133,12 @@ static spu_fn spu_lookup_fixed(const spu_context* ctx, uint32_t addr, int image_
               if (!s_said[e->ovl - 1]) { s_said[e->ovl - 1] = 1;
                   fprintf(stderr, "[spu-ovl] lifted overlay image %d resident (first hit LS 0x%05X, ctx img %d)\n",
                           o->image_id, addr, image_id); } }
+            { spu_ovl_cache_slot* c = &t_spu_ovl_cache[(addr >> 2) & 63u];
+              c->addr = addr; c->delta = 0; c->base = o->base; c->e = e; }
             return e->fn;
         }
         if (!(image_id == 0 || e->image_id == 0 || e->image_id == image_id)) continue;
-        if (ctx && ctx->policy_mode && addr + 8 <= SPU_LS_SIZE && e->sig_set) {
-            const uint8_t* q = ctx->ls + addr;
-            uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
-            uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+        if (have_hdr && ctx->policy_mode && e->sig_set) {
             if (w0 != e->sig0 || w1 != e->sig1) {
                 static int _n = 0;
                 if ((_n < 8 && (_n++, 1)))
@@ -2116,6 +2239,8 @@ static spu_fn spu_lookup_reloc(const spu_context* ctx, uint32_t addr, uint32_t* 
                         o->image_id, base, o->base, addr, 10); }
         }
         *delta = base - o->base;
+        { spu_ovl_cache_slot* c = &t_spu_ovl_cache[(addr >> 2) & 63u];
+          c->addr = addr; c->delta = *delta; c->base = base; c->e = e; }
         return e->fn;
     }
     return NULL;
@@ -2123,6 +2248,23 @@ static spu_fn spu_lookup_reloc(const spu_context* ctx, uint32_t addr, uint32_t* 
 
 spu_fn spu_lookup_ctx(const spu_context* ctx, uint32_t addr, int image_id)
 {
+    if (ctx && addr + 8 <= SPU_LS_SIZE) {
+        const spu_ovl_cache_slot* c = &t_spu_ovl_cache[(addr >> 2) & 63u];
+        const spu_reg_entry* e = c->e;
+        if (c->addr == addr && e && e->ovl) {
+            const uint8_t* q = ctx->ls + addr;
+            const uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+            const uint32_t w1 = ((uint32_t)q[4] << 24) | ((uint32_t)q[5] << 16) | ((uint32_t)q[6] << 8) | q[7];
+            if (w0 == e->sig0 && w1 == e->sig1) {
+                const spu_ovl_desc* o = &s_ovl[e->ovl - 1];
+                if (spu_mem_ne(ctx->ls + c->base + o->anchor, o->guid, 16) == 0 &&
+                    (e->len <= 8 || spu_mem_ne(q, o->bytes + (e->addr - o->base), e->len) == 0)) {
+                    ((spu_context*)ctx)->ls_delta = c->delta;
+                    return e->fn;
+                }
+            }
+        }
+    }
     spu_fn fn = spu_lookup_fixed(ctx, addr, image_id);
     if (fn) {
         if (ctx) ((spu_context*)ctx)->ls_delta = 0;
@@ -2932,13 +3074,28 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
-    { extern void spu_tr_note(spu_context*, char, uint32_t, uint32_t);
-      spu_tr_note(ctx, 'B', ctx->drain_ret_pc, ctx->drain_ret_sp); }
+    /* SPU instructions are 4-byte aligned and bi/bisl ignore the low two bits
+     * (used as table flags by Insomniac jobs). Ported from resistance-recomp;
+     * SPU_BRANCH_ALIGN=0 disables. */
+    { static int al = -1; if (al < 0) { const char* e = getenv("SPU_BRANCH_ALIGN"); al = e ? atoi(e) : 1; }
+      if (al && (ctx->pc & 3u)) {
+          static int _al_n = 0;
+          if (_al_n < 8) { _al_n++;
+              fprintf(stderr, "[spu] img=%d indirect branch to unaligned 0x%05X -> 0x%05X\n",
+                      ctx->image_id, ctx->pc, ctx->pc & ~3u); }
+          ctx->pc &= ~3u;
+      } }
+    { extern int g_spu_tr_on;
+      if (__builtin_expect(g_spu_tr_on > 0, 0)) {
+          extern void spu_tr_note(spu_context*, char, uint32_t, uint32_t);
+          spu_tr_note(ctx, 'B', ctx->drain_ret_pc, ctx->drain_ret_sp);
+      } }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
-    { extern int spu_irq_regs_maybe_restore(spu_context*);
+    if (__builtin_expect(ctx->irq_saved, 0)) {
+      extern int spu_irq_regs_maybe_restore(spu_context*);
       if (spu_irq_regs_maybe_restore(ctx)) {
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
@@ -2964,18 +3121,55 @@ void spu_indirect_branch(spu_context* ctx)
             return;
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
-            /* cellSpursModulePoll: report "no contention — keep running".
-             * (One virtual SPU per workload here, so nothing ever preempts.) */
+            /* cellSpursModulePoll / cellSpursModulePollStatus:
+             * Returns {selected_wid, pm_ea} in the preferred doubleword
+             * (r3._u32[0] = sel, r3._u32[1] = sel == cur ? LS[0x1D4] : 0).
+             * Policy modules such as pm_wwsjob compare r3 against LS[0x1DC]
+             * (current wid) and yield iff r3 != cur. */
+            extern uint8_t* vm_base;
+            #define PMR8(a)  ((uint32_t)vm_base[(uint32_t)(a)])
+            #define PMR16(a) ((PMR8(a) << 8) | PMR8((a) + 1))
+            #define PMR32(a) ((PMR16(a) << 16) | PMR16((a) + 2))
+            #define LSW(o)   (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)|((uint32_t)L[(o)+2]<<8)|L[(o)+3])
+            const uint8_t* L = ctx->ls;
+            uint32_t cur = LSW(0x1DC);
+            uint32_t sel = cur;
+            uint32_t best_pr = 0;
+            { static int s_nc = -1; if (s_nc < 0) s_nc = getenv("SPURS_PM_NO_CONTEND") ? 1 : 0;
+              if (!s_nc) {
+                uint32_t sea = LSW(0x1C4), lane = LSW(0x1C8);
+                if (sea && lane < 8 && cur < 16) {
+                    uint32_t en = PMR32(sea + 0xB0);
+                    uint32_t sig = PMR16(sea + 0x70);
+                    uint32_t mypr = PMR8(sea + 0xB00 + cur * 0x20 + 0x18 + lane) & 0xFu;
+                    best_pr = mypr ? mypr : 0x10u;
+                    for (uint32_t w = 0; w < 16; w++) {
+                        if (w == cur || !(en & (0x80000000u >> w)) || PMR8(sea + 0x80 + w) != 2) continue;
+                        /* SPURS priority: 0 = disabled, 1 = highest, 15 = lowest.
+                         * Preempt only for a strictly higher priority (smaller number). */
+                        uint32_t pr = PMR8(sea + 0xB00 + w * 0x20 + 0x18 + lane) & 0xFu;
+                        if (!pr || pr >= best_pr) continue;
+                        uint32_t maxc = PMR8(sea + 0x50 + w) & 0xFu;
+                        if (!maxc || PMR8(sea + 0x20 + w) >= maxc) continue;
+                        if (PMR8(sea + 0x00 + w) || (sig & (0x8000u >> w))) {
+                            best_pr = pr;
+                            sel = w;
+                        }
+                    }
+                }
+              }
+            }
             unsigned n = ++g_spurs_pm_polls;
-            /* Capped per process, not per run: the counter restarts with every
-             * policy run, and the WWS audio module runs ~1900 times a second,
-             * so "the first 4 of each run" was a line per run in the
-             * unbuffered log. */
-            { static int _shown = 0;
-              if (_shown < 8 && n <= 4) { _shown++;
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]); } }
-            ctx->gpr[3] = spu_make_preferred_u32(0);
+            { static int s_pt = -1; if (s_pt < 0) s_pt = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_pt && (n <= 4 || (n % 4096) == 0))
+                fprintf(stderr, "[spurs-pm] poll #%u (cur=%u r3=0x%08X) -> sel=%u (%s)\n",
+                        n, cur, ctx->gpr[3]._u32[0], sel, sel != cur ? "yield" : "continue"); }
+            ctx->gpr[3] = spu_make_preferred_u32(sel);
+            ctx->gpr[3]._u32[1] = (sel == cur) ? LSW(0x1D4) : 0;
+            #undef LSW
+            #undef PMR32
+            #undef PMR16
+            #undef PMR8
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

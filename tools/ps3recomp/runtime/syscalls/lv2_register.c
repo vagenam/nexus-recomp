@@ -274,6 +274,235 @@ typedef struct {
     int             done;
 } spu_thread_event_t;
 #endif
+#ifdef _WIN32
+/* HOST_PLACEMENT (ported from infamous2-recomp, PF1): isolate critical-path
+ * threads (frame clock, SPU workers, optionally PPU main) onto dedicated
+ * physical fast cores and confine remaining threads via process default CPU sets.
+ *   0 = off;
+ *   1 = frame clock on a dedicated physical core;
+ *   2 = frame clock + first 4 SPU workers on dedicated physical cores;
+ *   3 = that + PPU main thread on a dedicated physical core.
+ * HOST_PLACEMENT=auto|off|0-3 overrides ps3_host_placement_configure(). */
+#define HP_MAXC 64
+typedef struct { BYTE cidx, eff, llc, nid; ULONG ids[4]; } hp_core;
+static struct {
+    int mode, ncores;                   /* -1 undecided */
+    hp_core c[HP_MAXC];                 /* allowed cores, ascending CoreIndex */
+    int fast[HP_MAXC], nfast;           /* indexes into c: fast cores, descending CoreIndex */
+    int hybrid;
+    int defaults_set;
+    SRWLOCK lk;
+    int cfg;                            /* caller choice: 0 off (default), -1 auto, 1-3 mode */
+} s_hp = { -1, 0, {{0}}, {0}, 0, 0, 0, SRWLOCK_INIT, 0 };
+
+void ps3_host_placement_configure(int mode)
+{
+    AcquireSRWLockExclusive(&s_hp.lk);
+    if (s_hp.mode >= 0) fprintf(stderr, "[placement] configured after placement was decided: ignored\n");
+    else s_hp.cfg = mode < -1 ? -1 : mode > 3 ? 3 : mode;
+    ReleaseSRWLockExclusive(&s_hp.lk);
+}
+
+static int hp_core_of(BYTE cidx, int* nc)
+{
+    int k = 0;
+    while (k < *nc && s_hp.c[k].cidx != cidx) k++;
+    if (k < *nc) return k;
+    if (*nc >= HP_MAXC) return -1;
+    int at = *nc;
+    while (at > 0 && s_hp.c[at - 1].cidx > cidx) { s_hp.c[at] = s_hp.c[at - 1]; at--; }
+    memset(&s_hp.c[at], 0, sizeof s_hp.c[at]);
+    s_hp.c[at].cidx = cidx;
+    (*nc)++;
+    return at;
+}
+
+static int hp_pick_fast(int nc)
+{
+    BYTE maxe = 0;
+    for (int k = 0; k < nc; k++) if (s_hp.c[k].eff > maxe) maxe = s_hp.c[k].eff;
+    s_hp.hybrid = 0;
+    for (int k = 0; k < nc; k++) if (s_hp.c[k].eff != maxe) s_hp.hybrid = 1;
+    int best_llc = -1, best_n = 0;
+    for (int k = 0; k < nc; k++) {
+        if (s_hp.c[k].eff != maxe) continue;
+        int n = 0;
+        for (int j = 0; j < nc; j++) if (s_hp.c[j].eff == maxe && s_hp.c[j].llc == s_hp.c[k].llc) n++;
+        if (n > best_n) { best_n = n; best_llc = s_hp.c[k].llc; }
+    }
+    s_hp.nfast = 0;
+    for (int k = nc - 1; k >= 0; k--)
+        if (s_hp.c[k].eff == maxe && s_hp.c[k].llc == best_llc) s_hp.fast[s_hp.nfast++] = k;
+    return s_hp.nfast;
+}
+
+static int hp_auto(int nc, const char** why)
+{
+    const int F = s_hp.nfast;
+    int smt = F > 0, onellc = 1;
+    for (int i = 0; i < F; i++) if (s_hp.c[s_hp.fast[i]].nid < 2) smt = 0;
+    for (int k = 0; k < nc; k++) if (s_hp.c[k].llc != s_hp.c[0].llc) onellc = 0;
+    if (s_hp.hybrid) {
+        if (F >= 6) { *why = "a hybrid CPU with 6+ P-cores: busy threads on P-cores, rest on E-cores and leftover P-cores"; return 2; }
+        *why = "a hybrid CPU with under 6 P-cores: off"; return 0;
+    }
+    if (F >= 6 && smt && onellc) { *why = "6+ cores of one kind sharing one cache, with SMT"; return 2; }
+    *why = F < 6 ? "under 6 cores: off" : !smt ? "no SMT: off" : "two caches: off";
+    return 0;
+}
+
+static int hp_sim(const char* spec)
+{
+    int nc = 0; BYTE cidx = 0;
+    for (const char* p = spec; *p; ) {
+        int n = 0, cls = 0, t = 2;
+        if (sscanf(p, "%d:%dx%d", &n, &cls, &t) < 2) return 0;
+        for (int i = 0; i < n && nc < HP_MAXC; i++) {
+            hp_core* c = &s_hp.c[nc++];
+            memset(c, 0, sizeof *c);
+            c->cidx = cidx++; c->eff = (BYTE)cls; c->llc = 0; c->nid = (BYTE)(t < 1 ? 1 : t > 4 ? 4 : t);
+            for (int j = 0; j < c->nid; j++) c->ids[j] = 256u + nc * 4u + (ULONG)j;
+        }
+        p = strchr(p, ',');
+        if (!p) break;
+        p++;
+    }
+    return nc;
+}
+
+static void hp_init(void)               /* under s_hp.lk */
+{
+    const char* e = getenv("HOST_PLACEMENT");
+    const char* sim = getenv("HOST_PLACEMENT_SIM");
+    int req = s_hp.cfg;
+    if (e && *e) {
+        if (!strcmp(e, "auto") || !strcmp(e, "on")) req = -1;
+        else if (!strcmp(e, "off")) req = 0;
+        else if (e[0] >= '0' && e[0] <= '3' && !e[1]) req = e[0] - '0';
+        else fprintf(stderr, "[placement] HOST_PLACEMENT=%s not understood (auto | off | 0-3)\n", e);
+    }
+    if (sim && *sim) req = -1;
+    const int autom = req < 0;
+    s_hp.mode = 0;
+    if (req == 0) {
+        fprintf(stderr, "[placement] off%s: scheduler places every thread\n",
+                e && *e ? " (HOST_PLACEMENT)" : " (disabled)");
+        return;
+    }
+    int nc = 0;
+    if (sim && *sim) nc = hp_sim(sim);
+    else {
+        DWORD_PTR pmask = 0, smask = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &pmask, &smask) || !pmask) pmask = ~(DWORD_PTR)0;
+        ULONG len = 0;
+        GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+        unsigned char* buf = len ? (unsigned char*)malloc(len) : NULL;
+        if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
+            fprintf(stderr, "[placement] off: GetSystemCpuSetInformation error %lu\n",
+                    (unsigned long)GetLastError());
+            free(buf); return;
+        }
+        for (ULONG o = 0; o < len; ) {
+            const SYSTEM_CPU_SET_INFORMATION* si = (const SYSTEM_CPU_SET_INFORMATION*)(buf + o);
+            if (!si->Size) break;
+            if (si->Type == CpuSetInformation && si->CpuSet.Group == 0 &&
+                si->CpuSet.LogicalProcessorIndex < 8 * sizeof(DWORD_PTR) &&
+                (pmask >> si->CpuSet.LogicalProcessorIndex) & 1) {
+                const int k = hp_core_of(si->CpuSet.CoreIndex, &nc);
+                if (k >= 0) {
+                    hp_core* c = &s_hp.c[k];
+                    c->eff = si->CpuSet.EfficiencyClass; c->llc = si->CpuSet.LastLevelCacheIndex;
+                    if (c->nid < 4) c->ids[c->nid++] = si->CpuSet.Id;
+                }
+            }
+            o += si->Size;
+        }
+        free(buf);
+    }
+    const int F = hp_pick_fast(nc);
+    const char* why = "";
+    int mode = autom ? hp_auto(nc, &why) : req;
+    if (mode >= 3 && F < 7) mode = 2;
+    if (mode >= 2 && F < 5) mode = 1;
+    if (F < 2) mode = 0;
+    fprintf(stderr, "[placement] %smode %d%s: %d allowed core(s) in group 0, %d fast%s\n",
+            sim && *sim ? "SIM " : "", mode, autom ? " (auto)" : "", nc, F,
+            s_hp.hybrid ? " (P-cores; rest are E-cores)" : "");
+    if (autom) fprintf(stderr, "[placement]   auto: %s\n", why);
+    if (mode >= 1) {
+        fprintf(stderr, "[placement]   frame clock -> core %u", s_hp.c[s_hp.fast[0]].cidx);
+        if (mode >= 2) for (int i = 0; i < 4; i++) fprintf(stderr, ", SPU worker %d -> core %u", i, s_hp.c[s_hp.fast[1 + i]].cidx);
+        if (mode >= 3) fprintf(stderr, ", PPU main -> core %u", s_hp.c[s_hp.fast[5]].cidx);
+        else if (s_hp.hybrid) fprintf(stderr, ", PPU main -> %d P-cores left (shared)", F - (mode >= 2 ? 5 : 1));
+        fprintf(stderr, "; everything else on the other %d core(s)%s\n", nc - (mode >= 3 ? 6 : mode >= 2 ? 5 : 1),
+                s_hp.hybrid ? " (P-cores left and E-cores)" : "");
+    }
+    if (sim && *sim) { fprintf(stderr, "[placement]   (HOST_PLACEMENT_SIM: plan only)\n"); return; }
+    s_hp.ncores = nc; s_hp.mode = mode;
+}
+
+static int hp_reserved(void) { return s_hp.mode >= 3 ? 6 : s_hp.mode >= 2 ? 5 : s_hp.mode >= 1 ? 1 : 0; }
+static int hp_is_reserved(int k)
+{
+    const int r = hp_reserved();
+    for (int i = 0; i < r && i < s_hp.nfast; i++) if (s_hp.fast[i] == k) return 1;
+    return 0;
+}
+
+/* role 0: frame clock; role 1: SPU worker idx (0..3); role 2: PPU main thread. */
+int ps3_host_place_thread(int role, int idx)
+{
+    AcquireSRWLockExclusive(&s_hp.lk);
+    if (s_hp.mode < 0) hp_init();
+    int slot = -1;
+    if (s_hp.mode >= 1 && role == 0) slot = 0;
+    else if (s_hp.mode >= 2 && role == 1 && idx >= 0 && idx < 4) slot = 1 + idx;
+    else if (s_hp.mode >= 3 && role == 2) slot = 5;
+    const int ppu_p = s_hp.mode >= 1 && s_hp.mode < 3 && role == 2 && s_hp.hybrid;
+    if ((slot >= 0 || ppu_p) && !s_hp.defaults_set) {
+        ULONG rest[256]; ULONG nr = 0;
+        for (int k = 0; k < s_hp.ncores; k++)
+            if (!hp_is_reserved(k))
+                for (int i = 0; i < s_hp.c[k].nid && nr < 256; i++) rest[nr++] = s_hp.c[k].ids[i];
+        const BOOL ok = nr && SetProcessDefaultCpuSets(GetCurrentProcess(), rest, nr);
+        fprintf(stderr, "[placement] every other thread on the %d unreserved core(s) (%lu CPU sets): %s\n",
+                s_hp.ncores - hp_reserved(), (unsigned long)nr, ok ? "ok" : "FAILED: placement off");
+        s_hp.defaults_set = 1;
+        if (!ok) { s_hp.mode = 0; slot = -1; }
+    }
+    BOOL ok = FALSE;
+    int wanted = -1;
+    if (slot >= 0 && s_hp.mode >= 1) {
+        const hp_core* c = &s_hp.c[s_hp.fast[slot]];
+        wanted = c->cidx;
+        ok = SetThreadSelectedCpuSets(GetCurrentThread(), c->ids, (ULONG)c->nid);
+        if (!ok) {
+            SetProcessDefaultCpuSets(GetCurrentProcess(), NULL, 0);
+            s_hp.mode = 0;
+        }
+    } else if (ppu_p && s_hp.mode >= 1) {
+        ULONG ids[256]; ULONG n = 0;
+        for (int i = hp_reserved(); i < s_hp.nfast; i++) {
+            const hp_core* c = &s_hp.c[s_hp.fast[i]];
+            for (int j = 0; j < c->nid && n < 256; j++) ids[n++] = c->ids[j];
+        }
+        ok = n && SetThreadSelectedCpuSets(GetCurrentThread(), ids, n);
+        ReleaseSRWLockExclusive(&s_hp.lk);
+        fprintf(stderr, "[placement] PPU main thread on the %d P-core(s) left (%lu CPU sets, shared): %s\n",
+                s_hp.nfast - hp_reserved(), (unsigned long)n, ok ? "ok" : "FAILED");
+        return 0;
+    }
+    ReleaseSRWLockExclusive(&s_hp.lk);
+    if (wanted >= 0)
+        fprintf(stderr, "[placement] %s %d on core %d: %s\n",
+                role == 0 ? "frame clock" : role == 1 ? "SPU worker" : "PPU main thread", idx, wanted,
+                ok ? "ok" : "FAILED: placement off from here");
+    return wanted >= 0 && ok;
+}
+#else
+int ps3_host_place_thread(int role, int idx) { (void)role; (void)idx; return 0; }
+void ps3_host_placement_configure(int mode) { (void)mode; }
+#endif
 
 typedef struct {
     int      in_use;
@@ -741,6 +970,9 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#ifdef _WIN32
+    if (t->tid >= 0x2000u && t->tid <= 0x2003u) ps3_host_place_thread(1, (int)(t->tid - 0x2000u));
+#endif
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -780,6 +1012,9 @@ static void* spu_fallback_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#ifdef _WIN32
+    if (t->tid >= 0x2000u && t->tid <= 0x2003u) ps3_host_place_thread(1, (int)(t->tid - 0x2000u));
+#endif
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
