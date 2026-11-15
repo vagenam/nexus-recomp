@@ -14,7 +14,7 @@
   - Some **graphical glitches** still remain.
   - **Performance** is not perfect yet and can dip in heavy scenes.
   - **Audio** still experiences slowdown in places (such as startup/heavy load).
-- **Shipping Defaults:** Ships in **stock PS3 720p** (`1.00x`, stock texture filtering & shadow resolution) with **unlocked FPS** (`RACACIT_FPS_LIMIT=0`) so you can cap the framerate or raise resolution/settings yourself in the **F1 / Esc** menu.
+- **Shipping Defaults:** Ships in **stock PS3 720p** (`1.00x`, stock texture filtering & shadow resolution) with **unlocked FPS**, from my testing increasing resolution to 4k and maxing out shadow resolution had next to no negative impact on fps but it might be different for you
 - **Graphics (RSX → Vulkan 1.3):** Supports up to **4K (`3.00x`, `3840×2160`)** internal resolution scaling, anisotropic/trilinear filtering, and VRAM budget management.
 - **Audio:** Full FMV, menu, and in-game `cellAudio` mixing.
 - **Controls:** Keyboard & Mouse + SDL2 Gamepads (PlayStation DualSense / DualShock 4 with native HIDAPI haptics/speaker/triggers/lightbar, Xbox / XInput).
