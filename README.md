@@ -73,7 +73,10 @@ If you run into crashes, graphical glitches, or gameplay issues, please report t
 ---
 
 ## Support
-If for some reason someone wants to support this project, you can **[buy me a coffee](https://buymeacoffee.com/vagenam)**.
+If for some reason someone wants to, you can **[buy me a coffee](https://buymeacoffee.com/vagenam)**.
+The recomp is completely free and always will
+I do this bc i love ps3 era games and ratchet is one of my fav childhood series ;)
+
 
 ---
 
