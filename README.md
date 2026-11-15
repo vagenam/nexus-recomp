@@ -10,14 +10,20 @@
 ## Current Project Status (`v0.3`)
 - **Testing Scope:** The game has **not** been tested thoroughly yet — only the **first level** (Nebulox 7) has been tested, and it plays alright there. Later levels and full playthrough stability are unverified.
 - **Test Hardware:** Tested on an **Intel Xeon E5-2680 v4** (older server CPU, not optimal for single-thread/PPU-heavy emulation) and an **AMD Radeon RX 9060 XT 16 GB**. Systems with newer, faster desktop CPUs will likely get noticeably better performance.
-- **Known Issues:**
-  - Some **graphical glitches** still remain.
-  - **Performance** is not perfect yet and can dip in heavy scenes.
-  - **Audio** still experiences slowdown in places (such as startup/heavy load).
 - **Shipping Defaults:** Ships in **stock PS3 720p** (`1.00x`, stock texture filtering & shadow resolution) with **unlocked FPS**, from my testing increasing resolution to 4k and maxing out shadow resolution had next to no negative impact on fps but it might be different for you
 - **Graphics (RSX → Vulkan 1.3):** Supports up to **4K (`3.00x`, `3840×2160`)** internal resolution scaling, anisotropic/trilinear filtering, and VRAM budget management.
 - **Audio:** Full FMV, menu, and in-game `cellAudio` mixing.
 - **Controls:** Keyboard & Mouse + SDL2 Gamepads (PlayStation DualSense / DualShock 4 with native HIDAPI haptics/speaker/triggers/lightbar, Xbox / XInput).
+
+---
+
+## Known Issues
+- **Untested Beyond Level 1:** Only the first level (Nebulox 7) has been tested so far; later planets/levels and full playthrough stability are unverified.
+- **Graphical Glitches:** Some rendering and shader glitches still remain in certain scenes.
+- **Performance Dips:** Framerate is not locked 60 FPS everywhere yet and can dip in heavy scenes (especially on older server/multi-core CPUs such as Xeon E5-2680 v4).
+- **Audio Slowdown:** Audio can experience slowdown during startup or heavy CPU/SPU load.
+- **Bolt & Crate Debris Caps (Workaround):** Physical bolt spawns (`func_004E9F98`, value-scaled) and crate-plank debris Mobys (`func_00784E20`, `cls=0x55`) are capped at 3 per burst during active gameplay to prevent SPU `igAnim` stalls.
+- **4K Resolution Cap:** Internal resolution is capped at `3.00x` (4K `3840×2160`); `5K (4.00x)` is disabled to avoid Vulkan `VK_ERROR_OUT_OF_DEVICE_MEMORY` stalls.
 
 ---
 
