@@ -23,7 +23,7 @@
 
 ## Requirements
 - **Windows 10 / 11 (x86-64)**
-- **CPU with AVX2 support** (Intel Haswell / AMD Zen or newer; compiled with `-march=haswell`)
+- **CPU with AVX2 support** (Intel Haswell / AMD Zen or newer)
 - **Vulkan 1.3 capable GPU**
 - **No manual CMake/Ninja/Python install needed:** `RecompBuilder.exe` uses the prebundled offline toolchain (`tools\.portable\`) or auto-bootstraps it on first run.
 - **Your Own Game Dump (Zero Copyrighted Code/Assets Shipped):**
