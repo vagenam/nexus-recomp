@@ -9,6 +9,9 @@ out/
 scratch/
 __pycache__/
 tools/.portable/
+tools/sdl2-win-build/
+tools/sdl2-win/
+windows/toolchain/
 release/
 Put_Game_Folder_Here/*
 !Put_Game_Folder_Here/README.txt
