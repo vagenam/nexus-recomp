@@ -1,5 +1,5 @@
 # Project Raccoon — Ratchet & Clank: Into the Nexus PC Recomp (`v0.3.1`)
-Hopefuly now featuring working building!
+
 **Project Raccoon** is a native Windows x86-64 static recompilation of **Ratchet & Clank: Into the Nexus** (PS3 USA Disc version, `BCUS99245` v1.00) powered by the `ps3recomp` runtime.
 
 > **Note:** This project is created with Artificial Intelligence (AI).
