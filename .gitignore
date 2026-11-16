@@ -11,6 +11,10 @@ __pycache__/
 tools/.portable/
 tools/sdl2-win-build/
 tools/sdl2-win/
+tools/SDL2-src/
+tools/glslang-src/
+tools/Vulkan-Headers/
+tools/zlib/
 windows/toolchain/
 release/
 Put_Game_Folder_Here/*

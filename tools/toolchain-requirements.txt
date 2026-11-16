@@ -1,0 +1,7 @@
+# Pinned build toolchain installed by RecompBuilder into tools\.portable\
+# (pip install --require-hashes --only-binary=:all: --no-deps -r tools\toolchain-requirements.txt)
+# Hashes are for the win_amd64 / py3-none-any wheels. Bump deliberately -- zig cc
+# and cmake upgrades can change or break the build.
+cmake==4.4.5 --hash=sha256:d5521b4a9e864505c550abae99ff593d501bd08225583e69b3a9a4ca7f36a03f
+ninja==1.13.2 --hash=sha256:1293f4078278b70d0ee4b6cc8f3a9e030656c9b2f59909970343c4fe76070118
+ziglang==0.17.1 --hash=sha256:69c3dfc3aff6a297ec4017aa904782c0e450eb988982d7f675d83edce27526fb

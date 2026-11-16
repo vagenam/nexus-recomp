@@ -1,4 +1,4 @@
-# Project Raccoon — Ratchet & Clank: Into the Nexus PC Recomp (`v0.3`)
+# Project Raccoon — Ratchet & Clank: Into the Nexus PC Recomp (`v0.3.1`)
 
 **Project Raccoon** is a native Windows x86-64 static recompilation of **Ratchet & Clank: Into the Nexus** (PS3 USA Disc version, `BCUS99245` v1.00) powered by the `ps3recomp` runtime.
 
@@ -7,7 +7,7 @@
 
 ---
 
-## Current Project Status (`v0.3`)
+## Current Project Status (`v0.3.1`)
 - **Testing Scope:** The game has **not** been tested thoroughly yet — only the **first level** (Nebulox 7) has been tested, and it plays alright there. Later levels and full playthrough stability are unverified.
 - **Test Hardware:** Tested on an **Intel Xeon E5-2680 v4** (older server CPU, not optimal for single-thread/PPU-heavy emulation) and an **AMD Radeon RX 9060 XT 16 GB**. Systems with newer, faster desktop CPUs will likely get noticeably better performance.
 - **Shipping Defaults:** Ships in **stock PS3 720p** (`1.00x`, stock texture filtering & shadow resolution) with **unlocked FPS**, from my testing increasing resolution to 4k and maxing out shadow resolution had next to no negative impact on fps but it might be different for you
@@ -31,25 +31,36 @@
 - **Windows 10 / 11 (x86-64)**
 - **CPU with AVX2 support** (Intel Haswell / AMD Zen or newer)
 - **Vulkan 1.3 capable GPU**
-- **No manual CMake/Ninja/Python install needed:** `RecompBuilder.exe` uses the prebundled offline toolchain (`tools\.portable\`) or auto-bootstraps it on first run.
+- **No manual tool installs required in release zips:** The prepackaged release zip includes `RecompBuilder.exe` with a prebundled portable toolchain (`tools\.portable\`). When running from a clean git clone, `RecompBuilder` or `build_pipeline.py` will automatically download and verify pinned toolchain dependencies (Python 3.12 embeddable, CMake, Ninja, Zig).
 - **Your Own Game Dump (Zero Copyrighted Code/Assets Shipped):**
   1. **Extracted `PS3_GAME` folder** from **Ratchet & Clank: Into the Nexus (USA)** (`BCUS99245` v1.00) — **must be the extracted `PS3_GAME` folder** (containing `USRDIR\` and `PARAM.SFO`), **NOT** a `.pkg`, **NOT** an `.iso` (extract `.iso`/`.pkg` first if needed).
-  2. **Decrypted `EBOOT.ELF` from RPCS3:** In RPCS3, go to **Utilities → Decrypt PS3 Binaries**, select `PS3_GAME\USRDIR\EBOOT.BIN`, and save the decrypted `EBOOT.ELF`.
+     *(Note: during setup, your decrypted `EBOOT.elf` is copied into `PS3_GAME\USRDIR\EBOOT.elf` so the recomp runtime can locate it).*
+  2. **Decrypted `EBOOT.ELF` from RPCS3:** In RPCS3, go to **Utilities → Decrypt PS3 Binaries**, select `PS3_GAME\USRDIR\EBOOT.BIN`, and save the decrypted `EBOOT.ELF` (SHA-256 is verified up front against `BCUS99245` v1.00).
 
 ---
 
 ## Quick Start (`RecompBuilder.exe`)
+> **Note:** This Quick Start guide is for users downloading the ready-to-use **Releases zip** (`Project-Raccoon-v0.3.1-win64.zip`), which comes with `RecompBuilder.exe` and offline toolchain prebundled. If you are building from a Git clone, compile `tools/RecompBuilder.cpp` or run `build_pipeline.py` / `build.bat`.
+
 We do **not** ship a precompiled `NexusRecomp.exe` or any copyrighted game code/assets. `RecompBuilder.exe` is a native Windows GUI app that handles everything automatically:
 
 1. Double-click **`RecompBuilder.exe`** (no console commands or manual tool installs).
 2. Drop your **extracted `PS3_GAME` folder** into `Put_Game_Folder_Here\` (or click **Browse...** — must contain `USRDIR\` and `PARAM.SFO`, not `.iso` or `.pkg`).
 3. Drop your **RPCS3-decrypted `EBOOT.ELF`** into `Put_ELF_Here\` (or click **Browse...**).
-4. Click **Build & Setup** — it uses the prebundled portable toolchain (`tools\.portable\`) to lift & compile your executable into **`RecompFolder\NexusRecomp.exe`** and writes **`RecompFolder\settings.txt`** (stock 720p, unlocked FPS, FPS counter on).
+4. Click **Build & Setup** — it verifies your dump & ELF, lifts & compiles your executable into **`RecompFolder\NexusRecomp.exe`**, and writes **`RecompFolder\settings.txt`** (stock 720p, unlocked FPS, FPS counter on).
 5. Click **Play** (or launch **`RecompFolder\NexusRecomp.exe`** / the Desktop shortcut).
 
 ---
 
-## `v0.3` Changelog
+## `v0.3.1` Changelog
+- **Fixed Installer & Setup:** Resolved issues where v0.3 release / setup failed on fresh clones or external paths (untracked stale CMake caches and hardcoded directories).
+- **ELF & Game Dump Verification:** Added up-front SHA-256 verification of `EBOOT.ELF` and title-ID validation of `PARAM.SFO` (`BCUS99245` v1.00), preventing cryptic lifter crashes when an incompatible dump is provided.
+- **Lift Stamp Invalidation:** The pipeline and builder now track lift stamps (`out/lift_stamp.txt`), correctly invalidating outdated or stale lifts instead of silently skipping them.
+- **Pinned & Hash-Verified Toolchain:** Pin exact versions of `cmake`, `ninja`, and `ziglang` with SHA-256 hash checks via `tools/toolchain-requirements.txt`.
+- **Dynamic Threading / Hardware Scaling:** Replaced hardcoded core counts (`-j14`/`-j10`) with `os.cpu_count()` and `%NUMBER_OF_PROCESSORS%` (configurable via `NEXUS_JOBS`).
+- **Cleaned Repo Bloat & Licenses:** Untracked vendored redundant source trees (saving ~170MB), added root `LICENSE` (MIT), and updated `THIRD_PARTY_NOTICES.txt` with Vulkan-Headers, glslang, zlib, and LGPL-2.1 `at3_standalone`.
+
+---
 - **Dynamic Bolt Spawn Cap (`func_004E9F98`):** Caps physical bolt spawns at 3 per burst while scaling each bolt's value so economy/progression remains 100% exact.
 - **Crate Debris Moby Burst Cap (`func_00784E20`):** Caps runaway crate-plank Moby bursts (`cls=0x55`) during active gameplay (after the first 2s of level load), eliminating the `igAnim` (`0x00588B80`) SPU stall and 8.5 FPS hang.
 - **SPU / SPURS Channel & Drain Optimizations:** AVX2 `spu_mem_ne`, 64-entry `_Thread_local` overlay cache, hoisted `w0/w1` checks, `spu_lr_wait` `SleepConditionVariableSRW` backoff, power-of-2 ring (`RING=32`), and guarded `yz_lockstep_tick`.

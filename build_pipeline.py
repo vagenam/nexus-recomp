@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 End-to-end automated static recompilation & build pipeline for:
-  Ratchet & Clank: Into the Nexus (BCUS99245 v1.00) -> Windows x86-64 (Xeon E5-2680 v4 AVX2/FMA3 + RX 9060 XT 4K/60)
+  Ratchet & Clank: Into the Nexus (BCUS99245 v1.00) -> Windows x86-64 (AVX2/FMA3, Vulkan 1.3)
 
 Runs all stages in a single script so no interactive shell prompts are needed:
-  Stage 1: Prepare patched ps3recomp SDK + external libs (Vulkan-Headers, glslang, zlib, SDL2)
+  Stage 0: Verify inputs (EBOOT.ELF SHA-256 + PARAM.SFO title ID / version)
+  Stage 1: Check vendored ps3recomp SDK + download pinned, hash-verified libs (Vulkan-Headers, glslang, zlib, SDL2)
   Stage 2: Lift PPU EBOOT.ELF (14,728 functions) + VMX alias fix + Insomniac PPU post-lift patches + HLE NIDs
   Stage 3: Lift SPU workloads (3 embedded SPU ELFs, 2 SPURS policy modules, igpm_rt, 207 igPm jobs & relocatable submodules)
   Stage 4: Generate game sources + toolchain & compile NexusRecomp.exe with zig cc (Broadwell AVX2/FMA3)
@@ -13,6 +14,7 @@ Runs all stages in a single script so no interactive shell prompts are needed:
 
 import concurrent.futures
 import glob
+import hashlib
 import io
 import json
 import os
@@ -26,7 +28,6 @@ import urllib.request
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-REPOS = os.environ.get("NEXUS_REPOS", os.path.join(os.path.dirname(ROOT), "repos"))
 PORTABLE_DIR = os.path.join(ROOT, "tools", ".portable")
 VENV_SCRIPTS = os.path.dirname(sys.executable)
 PYTHON_EXE = sys.executable
@@ -34,20 +35,42 @@ CMAKE_EXE = shutil.which("cmake") or os.path.join(PORTABLE_DIR, "Lib", "site-pac
 NINJA_EXE = shutil.which("ninja") or os.path.join(PORTABLE_DIR, "Scripts", "ninja.exe")
 ZIG_EXE = shutil.which("zig") or os.path.join(PORTABLE_DIR, "Lib", "site-packages", "ziglang", "zig.exe")
 
+def _game_root_from(g):
+    g = g.strip().strip('"')
+    return os.path.dirname(g) if os.path.basename(g.rstrip("\\/")).upper() == "PS3_GAME" else g
+
+
 def _find_game_root():
     env_g = os.environ.get("NEXUS_PS3_GAME", "").strip()
     if env_g:
-        return os.path.dirname(env_g) if os.path.basename(env_g).upper() == "PS3_GAME" else env_g
-    settings_p = os.path.join(ROOT, "dist", "settings.txt")
-    if os.path.exists(settings_p):
-        with open(settings_p, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("GAME="):
-                    g = line[5:].strip()
-                    return os.path.dirname(g) if os.path.basename(g).upper() == "PS3_GAME" else g
-    return ROOT
+        return _game_root_from(env_g)
+    for settings_p in (os.path.join(ROOT, "RecompFolder", "settings.txt"),
+                       os.path.join(ROOT, "dist", "settings.txt")):
+        if os.path.exists(settings_p):
+            with open(settings_p, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("GAME=") and line[5:].strip():
+                        return _game_root_from(line[5:])
+    return None
 
 GAME_ROOT = _find_game_root()
+
+# ---------------------------------------------------------------------------
+# Supported input. Every hardcoded guest address in this pipeline and in the
+# game harness (0x00D3D680, 0x00C14A80, func_00A084CC, ...) is only valid for
+# this exact binary, so anything else is rejected up front instead of failing
+# minutes later in Stage 3.
+# ---------------------------------------------------------------------------
+EXPECTED_TITLE_ID = "BCUS99245"
+EXPECTED_APP_VER = "01.00"
+# SHA-256 of EBOOT.BIN (BCUS99245 v1.00) decrypted with RPCS3 "Decrypt PS3 Binaries"
+EXPECTED_ELF_SHA256 = "ca1a1a293d211095fc834eaaa10cd5fa9248b0e0328919fdeadeed1675c52c3f"
+# Bump when the lift/post-lift patching logic changes so old lifts are redone.
+LIFT_RECIPE_VERSION = "3"
+
+# Parallelism: default to all logical CPUs; override with NEXUS_JOBS=<n>
+# (lower it if the compile runs out of RAM -- lifted TUs are large).
+JOBS = max(1, int(os.environ.get("NEXUS_JOBS", "0") or 0) or (os.cpu_count() or 4))
 ELF_PATH = os.path.join(ROOT, "elf", "EBOOT.ELF")
 OUT_DIR = os.path.join(ROOT, "out")
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -64,139 +87,111 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def apply_unified_patch_py(patch_path, target_dir):
-    """Pure-Python unified diff applier that handles LF/CRLF transparently."""
-    with open(patch_path, "rb") as f:
-        raw_patch = f.read().replace(b"\r\n", b"\n").decode("utf-8", errors="replace")
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    lines = raw_patch.split("\n")
-    i = 0
-    n = len(lines)
-    files_patched = 0
 
-    while i < n:
-        line = lines[i]
-        if not line.startswith("diff --git "):
-            i += 1
-            continue
-
-        # Parse diff header
-        m = re.match(r"diff --git a/(.*?) b/(.*?)$", line)
-        if not m:
-            i += 1
-            continue
-        rel_path = m.group(2)
-        i += 1
-
-        is_new = False
-        is_deleted = False
-        while i < n and not lines[i].startswith("@@ ") and not lines[i].startswith("diff --git "):
-            if lines[i].startswith("new file mode"):
-                is_new = True
-            elif lines[i].startswith("deleted file mode"):
-                is_deleted = True
-            i += 1
-
-        full_path = os.path.join(target_dir, rel_path.replace("/", os.sep))
-        if is_deleted:
-            if os.path.exists(full_path):
-                os.remove(full_path)
-            while i < n and not lines[i].startswith("diff --git "):
-                i += 1
-            files_patched += 1
-            continue
-
-        if is_new or not os.path.exists(full_path):
-            orig_lines = []
+def read_param_sfo(path):
+    """Minimal PARAM.SFO reader -> {key: str|int}."""
+    with open(path, "rb") as f:
+        d = f.read()
+    if d[:4] != b"\x00PSF":
+        raise ValueError("not a PARAM.SFO file (bad magic)")
+    key_tab, data_tab, count = struct.unpack("<III", d[8:20])
+    out = {}
+    for i in range(count):
+        k_off, fmt, d_len, _d_max, d_off = struct.unpack("<HHIII", d[20 + i * 16 : 36 + i * 16])
+        k_start = key_tab + k_off
+        key = d[k_start : d.index(b"\x00", k_start)].decode("ascii", "replace")
+        raw = d[data_tab + d_off : data_tab + d_off + d_len]
+        if fmt == 0x0404:
+            out[key] = struct.unpack("<I", raw[:4])[0]
         else:
-            with open(full_path, "rb") as f:
-                content = f.read().replace(b"\r\n", b"\n").decode("utf-8", errors="replace")
-            if content.endswith("\n"):
-                orig_lines = content[:-1].split("\n")
-            elif content == "":
-                orig_lines = []
+            out[key] = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    return out
+
+
+class InputError(Exception):
+    pass
+
+
+def stage0_verify_inputs():
+    """Fail fast if the ELF or the game dump is not BCUS99245 v1.00."""
+    log("=== STAGE 0: Verifying EBOOT.ELF & PS3_GAME ===")
+    allow_unknown = os.environ.get("NEXUS_ALLOW_UNKNOWN_ELF", "0") == "1"
+    problems = []
+
+    if GAME_ROOT is None:
+        problems.append("PS3_GAME folder not set (set NEXUS_PS3_GAME or GAME= in RecompFolder\\settings.txt).")
+    else:
+        ps3_game = os.path.join(GAME_ROOT, "PS3_GAME")
+        sfo = os.path.join(ps3_game, "PARAM.SFO")
+        if not os.path.isdir(os.path.join(ps3_game, "USRDIR")) or not os.path.isfile(sfo):
+            problems.append(f"{ps3_game} must contain both USRDIR\\ and PARAM.SFO (extracted PS3_GAME folder, not .iso/.pkg).")
+        else:
+            try:
+                p = read_param_sfo(sfo)
+            except (OSError, ValueError, struct.error) as e:
+                problems.append(f"Could not read {sfo}: {e}")
             else:
-                orig_lines = content.split("\n")
-
-        # Apply hunks
-        offset = 0
-        while i < n and lines[i].startswith("@@ "):
-            hm = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
-            if not hm:
-                raise RuntimeError(f"Malformed hunk header in {rel_path}: {lines[i]}")
-            old_start = int(hm.group(1))
-            i += 1
-
-            old_chunk = []
-            new_chunk = []
-            while i < n and not lines[i].startswith("@@ ") and not lines[i].startswith("diff --git "):
-                hl = lines[i]
-                if hl == r"\ No newline at end of file":
-                    i += 1
-                    continue
-                if hl == "" and i == n - 1:
-                    i += 1
-                    break
-                prefix = hl[0] if hl else " "
-                body = hl[1:] if hl else ""
-                if prefix == " ":
-                    old_chunk.append(body)
-                    new_chunk.append(body)
-                elif prefix == "-":
-                    old_chunk.append(body)
-                elif prefix == "+":
-                    new_chunk.append(body)
+                tid = p.get("TITLE_ID", "?")
+                ver = p.get("APP_VER", p.get("VERSION", "?"))
+                if tid != EXPECTED_TITLE_ID:
+                    problems.append(f"PARAM.SFO TITLE_ID is {tid}, expected {EXPECTED_TITLE_ID} (Ratchet & Clank: Into the Nexus, USA disc).")
                 else:
-                    break
-                i += 1
+                    log(f"  PARAM.SFO: TITLE_ID={tid} APP_VER={ver} [OK]")
+                    if ver != EXPECTED_APP_VER:
+                        log(f"  [WARN] APP_VER {ver} != {EXPECTED_APP_VER}; only the v1.00 disc EBOOT is supported.")
 
-            pos = max(0, old_start - 1 + offset)
-            if not old_chunk:
-                orig_lines[pos:pos] = new_chunk
-                offset += len(new_chunk)
+    if not os.path.isfile(ELF_PATH):
+        problems.append(f"Decrypted EBOOT.ELF not found at {ELF_PATH}.")
+    else:
+        with open(ELF_PATH, "rb") as f:
+            magic = f.read(4)
+        if magic != b"\x7fELF":
+            problems.append(f"{ELF_PATH} is not a decrypted ELF (encrypted SELF/EBOOT.BIN?). Decrypt it with RPCS3: Utilities -> Decrypt PS3 Binaries.")
+        else:
+            digest = sha256_file(ELF_PATH)
+            if digest == EXPECTED_ELF_SHA256:
+                log(f"  EBOOT.ELF SHA-256 {digest[:16]}... [OK] (BCUS99245 v1.00)")
+            elif allow_unknown:
+                log(f"  [WARN] EBOOT.ELF SHA-256 {digest} is unknown; continuing because NEXUS_ALLOW_UNKNOWN_ELF=1.")
             else:
-                # Locate old_chunk near pos
-                found_at = None
-                if orig_lines[pos : pos + len(old_chunk)] == old_chunk:
-                    found_at = pos
-                else:
-                    # Search nearby window first, then full file
-                    for delta in range(-200, 201):
-                        cand = pos + delta
-                        if 0 <= cand <= len(orig_lines) - len(old_chunk):
-                            if orig_lines[cand : cand + len(old_chunk)] == old_chunk:
-                                found_at = cand
-                                break
-                    if found_at is None:
-                        # Strip trailing whitespace fallback
-                        old_stripped = [x.rstrip() for x in old_chunk]
-                        for cand in range(len(orig_lines) - len(old_chunk) + 1):
-                            if [x.rstrip() for x in orig_lines[cand : cand + len(old_chunk)]] == old_stripped:
-                                found_at = cand
-                                break
-                if found_at is None:
-                    raise RuntimeError(
-                        f"Failed to apply hunk in {rel_path} around line {old_start} (first line: {old_chunk[0]!r})"
-                    )
-                orig_lines[found_at : found_at + len(old_chunk)] = new_chunk
-                offset = found_at - (old_start - 1) + (len(new_chunk) - len(old_chunk))
+                problems.append(
+                    f"EBOOT.ELF SHA-256 is {digest}, expected {EXPECTED_ELF_SHA256}.\n"
+                    "    Only the RPCS3-decrypted EBOOT.BIN of BCUS99245 v1.00 (disc, no update) is supported --\n"
+                    "    the pipeline relies on fixed v1.00 addresses. (Override: NEXUS_ALLOW_UNKNOWN_ELF=1, unsupported.)"
+                )
 
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
-            f.write(("\n".join(orig_lines) + "\n").encode("utf-8"))
-        files_patched += 1
-
-    return files_patched
+    if problems:
+        for pr in problems:
+            log(f"  [ERROR] {pr}")
+        raise InputError("Input verification failed; see errors above.")
 
 
-def download_and_extract_zip(url, dest_dir):
-    if os.path.isdir(dest_dir) and os.listdir(dest_dir):
+def download_and_extract_zip(url, dest_dir, sha256=None, stamp=None):
+    """Download a pinned zip, verify its SHA-256, extract to dest_dir.
+
+    A `.pinned` stamp file records which archive the folder came from, so a
+    folder left over from a different pin (or a partial extract) is replaced.
+    """
+    stamp_p = os.path.join(dest_dir, ".pinned")
+    want = stamp or sha256 or url
+    if os.path.isfile(stamp_p) and open(stamp_p, "r").read().strip() == want:
         log(f"  [cached] {os.path.basename(dest_dir)}")
         return
     log(f"  Downloading {url} -> {dest_dir} ...")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         data = resp.read()
+    if sha256:
+        got = hashlib.sha256(data).hexdigest()
+        if got != sha256:
+            raise RuntimeError(f"SHA-256 mismatch for {url}: got {got}, expected {sha256}")
     tmp_extract = dest_dir + "_tmp"
     shutil.rmtree(tmp_extract, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -207,39 +202,61 @@ def download_and_extract_zip(url, dest_dir):
         shutil.rmtree(dest_dir)
     shutil.move(inner, dest_dir)
     shutil.rmtree(tmp_extract, ignore_errors=True)
+    with open(stamp_p, "w") as f:
+        f.write(want + "\n")
+
+
+# Pinned third-party sources (downloaded, never vendored in git). SHA-256 is of
+# the GitHub archive zip.
+PINNED_DEPS = [
+    ("Vulkan-Headers", "https://github.com/KhronosGroup/Vulkan-Headers/archive/c46850864f4661461b0f6cb9922c058ffea4915e.zip",
+     "45fd1cbfba537884f8a54d5dc2a69cb18de42fd94e84dc6a9bf66b5df829d79a"),
+    ("glslang-src", "https://github.com/KhronosGroup/glslang/archive/2fbed5e1fb43a1c480fe020e3bb686a31010989a.zip",
+     "6c241ca6d3b88ac602e572401f95de1c247110d900d1bbb3e302c4f3714515cc"),
+    ("zlib", "https://github.com/madler/zlib/archive/767c4c947852e143f582c85f14cf573411df1b35.zip",
+     "7416fc424ed245c961e998e149ffca387c572db63db25a86bf17f81306ed4201"),
+    ("SDL2-src", "https://github.com/libsdl-org/SDL/archive/refs/tags/release-2.32.10.zip",
+     "7a3c207b8509edc487d658df357ad764cd852d68fe248d307b25c0741d52fdf0"),
+]
+
+
+def _cmake_cache_source(build_dir):
+    cache = os.path.join(build_dir, "CMakeCache.txt")
+    if not os.path.exists(cache):
+        return None
+    with open(cache, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("CMAKE_HOME_DIRECTORY:"):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+def _drop_stale_cmake_dir(build_dir, source_dir):
+    """CMake refuses a cache created for another source path (e.g. a moved clone)."""
+    src = _cmake_cache_source(build_dir)
+    if src is not None and os.path.normcase(os.path.abspath(src)) != os.path.normcase(os.path.abspath(source_dir)):
+        log(f"  Removing stale CMake build dir {build_dir} (was configured for {src}) ...")
+        shutil.rmtree(build_dir, ignore_errors=True)
 
 
 def stage1_prepare_sdk_and_deps():
-    log("=== STAGE 1: Preparing Patched ps3recomp SDK & Dependencies ===")
+    log("=== STAGE 1: Checking ps3recomp SDK & Preparing Dependencies ===")
     os.makedirs(TOOLS_DIR, exist_ok=True)
 
-    marker = os.path.join(PS3R_DIR, ".racacit_patched")
-    if not os.path.exists(marker):
-        if os.path.exists(PS3R_DIR):
-            shutil.rmtree(PS3R_DIR)
-        log("Downloading sp00nznet/ps3recomp @ 5244db92669b54831c6d3ebb7a96d58c4dbfa6df ...")
-        download_and_extract_zip(
-            "https://github.com/sp00nznet/ps3recomp/archive/5244db92669b54831c6d3ebb7a96d58c4dbfa6df.zip",
-            PS3R_DIR,
-        )
-        patch_file = os.path.join(REPOS, "RACiT", "patches", "ps3recomp-0001-racacit-runtime-fixes.patch")
-        log("Applying ps3recomp-0001-racacit-runtime-fixes.patch ...")
-        count = apply_unified_patch_py(patch_file, PS3R_DIR)
-        with open(marker, "w") as f:
-            f.write(f"patched {count} files\n")
-        log(f"Successfully patched {count} files in ps3recomp!")
-    else:
-        log("ps3recomp already patched.")
+    # tools/ps3recomp is vendored in this repo: upstream sp00nznet/ps3recomp
+    # @ 5244db9 + the RACiT runtime-fixes patch (MIT) + Nexus-specific runtime
+    # changes. It is the source of truth and is never re-downloaded, because a
+    # fresh upstream copy would lose the Nexus changes.
+    for need in ("CMakeLists.txt", os.path.join("tools", "ppu_lifter.py"), os.path.join("tools", "spu_lifter.py")):
+        if not os.path.exists(os.path.join(PS3R_DIR, need)):
+            raise FileNotFoundError(
+                f"Vendored ps3recomp is incomplete (missing tools/ps3recomp/{need.replace(os.sep, '/')}). "
+                "Re-clone the repository or run `git checkout -- tools/ps3recomp`."
+            )
+    log("ps3recomp SDK present (vendored).")
 
-    # Download exact pinned dependencies used by RACiT Windows build
-    deps = [
-        ("Vulkan-Headers", "https://github.com/KhronosGroup/Vulkan-Headers/archive/c46850864f4661461b0f6cb9922c058ffea4915e.zip"),
-        ("glslang-src", "https://github.com/KhronosGroup/glslang/archive/2fbed5e1fb43a1c480fe020e3bb686a31010989a.zip"),
-        ("zlib", "https://github.com/madler/zlib/archive/767c4c947852e143f582c85f14cf573411df1b35.zip"),
-        ("SDL2-src", "https://github.com/libsdl-org/SDL/archive/refs/tags/release-2.32.10.zip"),
-    ]
-    for name, url in deps:
-        download_and_extract_zip(url, os.path.join(TOOLS_DIR, name))
+    for name, url, sha in PINNED_DEPS:
+        download_and_extract_zip(url, os.path.join(TOOLS_DIR, name), sha256=sha)
 
     # Write zig toolchain files in windows/toolchain/
     tc_dir = os.path.join(WIN_DIR, "toolchain")
@@ -266,6 +283,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
         log("Building static SDL2 with zig cc ...")
         sdl2_build = os.path.join(TOOLS_DIR, "sdl2-win-build")
         sdl2_install = os.path.join(TOOLS_DIR, "sdl2-win")
+        _drop_stale_cmake_dir(sdl2_build, os.path.join(TOOLS_DIR, "SDL2-src"))
         env = os.environ.copy()
         env["PATH"] = VENV_SCRIPTS + os.pathsep + env.get("PATH", "")
         subprocess.run(
@@ -286,7 +304,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
             check=True,
         )
         subprocess.run(
-            [CMAKE_EXE, "--build", sdl2_build, "--target", "install", "-j14"],
+            [CMAKE_EXE, "--build", sdl2_build, "--target", "install", f"-j{JOBS}"],
             env=env,
             check=True,
         )
@@ -426,8 +444,40 @@ extern "C" void racacit_longjmp(uint32_t guest_buf);
     )
 
 
+LIFT_STAMP = os.path.join(OUT_DIR, "lift_stamp.txt")
+
+
+def _expected_lift_stamp():
+    return f"elf_sha256={sha256_file(ELF_PATH)}\nrecipe={LIFT_RECIPE_VERSION}\n"
+
+
+def invalidate_stale_lift():
+    """Wipe generated lift output if it was produced from a different ELF / recipe.
+
+    Previously only the existence of ppu_recomp.h was checked, so a stale
+    elf/EBOOT.ELF or an old lift was silently reused.
+    """
+    want = _expected_lift_stamp()
+    have = open(LIFT_STAMP, "r").read() if os.path.exists(LIFT_STAMP) else None
+    if have == want:
+        return False
+    if have is None and not os.path.exists(os.path.join(RECOMP_DIR, "ppu_recomp.h")) and not os.path.isdir(SPU_DIR):
+        return False  # nothing generated yet
+    log("Lift output is stale (different EBOOT.ELF or lift recipe) -- removing generated sources ...")
+    for d in (OUT_DIR, RECOMP_DIR, SPU_DIR):
+        shutil.rmtree(d, ignore_errors=True)
+    return True
+
+
+def write_lift_stamp():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(LIFT_STAMP, "w") as f:
+        f.write(_expected_lift_stamp())
+
+
 def stage2_lift_ppu():
     log("=== STAGE 2: Lifting PPU Code (14,728 functions) ===")
+    invalidate_stale_lift()
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(RECOMP_DIR, exist_ok=True)
     func_json = os.path.join(OUT_DIR, "EBOOT.functions.json")
@@ -856,9 +906,9 @@ def stage3_lift_spu():
         sub_extra = {0x10000 + sub_entry} if 0x20 <= sub_entry < size else {0x10020}
         tasks.append((1000 + j, "sub", a, size, 0x10000, raw, sub_extra, False, True, jobs_out_raw, SPU_DIR))
 
-    log(f"  Lifting {len(tasks)} SPU job/submodule images across 14 Xeon cores ...")
+    log(f"  Lifting {len(tasks)} SPU job/submodule images across {JOBS} worker threads ...")
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=14) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as ex:
         for res in ex.map(lift_one_spu_job, tasks):
             results.append(res)
 
@@ -957,6 +1007,7 @@ def stage4_write_sources_and_build():
     env = os.environ.copy()
     env["PATH"] = VENV_SCRIPTS + os.pathsep + env.get("PATH", "")
 
+    _drop_stale_cmake_dir(BUILD_DIR, WIN_DIR)
     if not os.path.exists(os.path.join(BUILD_DIR, "build.ninja")):
         log("Configuring CMake build (build-win) ...")
         tc_file = os.path.join(WIN_DIR, "toolchain", "zig-windows.cmake")
@@ -977,9 +1028,9 @@ def stage4_write_sources_and_build():
             check=True,
         )
 
-    log("Building NexusRecomp.exe with Ninja (-j10 for 32GB RAM safety across Xeon cores) ...")
+    log(f"Building NexusRecomp.exe with Ninja (-j{JOBS}; set NEXUS_JOBS lower if you run out of RAM) ...")
     subprocess.run(
-        [CMAKE_EXE, "--build", BUILD_DIR, "-j10"],
+        [CMAKE_EXE, "--build", BUILD_DIR, f"-j{JOBS}"],
         env=env,
         check=True,
     )
@@ -1002,9 +1053,11 @@ def stage5_stage_and_verify():
     if not os.path.exists(exe_src):
         raise RuntimeError(f"Expected executable not found at {exe_src}")
 
-    # Copy decrypted EBOOT.ELF into the user's PS3_GAME/USRDIR/EBOOT.elf so the runner finds it automatically
+    # Copy decrypted EBOOT.ELF into the user's PS3_GAME/USRDIR/EBOOT.elf so the runner finds it
+    # automatically. NOTE: this adds one file to the user's dump (documented in README); EBOOT.BIN
+    # and all other game files are left untouched.
     usrdir_eboot = os.path.join(GAME_ROOT, "PS3_GAME", "USRDIR", "EBOOT.elf")
-    if not os.path.exists(usrdir_eboot):
+    if not os.path.exists(usrdir_eboot) or sha256_file(usrdir_eboot) != sha256_file(ELF_PATH):
         log(f"Copying decrypted EBOOT.elf to {usrdir_eboot} ...")
         shutil.copy2(ELF_PATH, usrdir_eboot)
 
@@ -1066,9 +1119,15 @@ def stage5_stage_and_verify():
 
 def main():
     t0 = time.time()
+    try:
+        stage0_verify_inputs()
+    except InputError as e:
+        log(f"[ERROR] {e}")
+        sys.exit(2)
     stage1_prepare_sdk_and_deps()
     stage2_lift_ppu()
     stage3_lift_spu()
+    write_lift_stamp()
     stage4_write_sources_and_build()
     stage5_stage_and_verify()
     log(f"=== ALL STAGES COMPLETE in {(time.time() - t0) / 60.0:.1f} minutes! ===")

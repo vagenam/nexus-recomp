@@ -16,6 +16,10 @@ if exist "%~dp0tools\.portable\python.exe" (
 )
 
 echo [1/4] Checking CMake build configuration...
+if not exist "%~dp0windows\toolchain\zig-windows.cmake" (
+    echo [ERROR] windows\toolchain\ not generated yet. Run build_pipeline.py ^(or RecompBuilder^) once first.
+    exit /b 1
+)
 if not exist "build-win\build.ninja" goto do_cmake
 goto do_build
 
@@ -29,7 +33,8 @@ if errorlevel 1 (
 
 :do_build
 echo [2/4] Building NexusRecomp.exe with Ninja...
-"%NINJA_EXE%" -C "%~dp0build-win" -j10 NexusRecomp.exe
+if not defined NEXUS_JOBS set "NEXUS_JOBS=%NUMBER_OF_PROCESSORS%"
+"%NINJA_EXE%" -C "%~dp0build-win" -j%NEXUS_JOBS% NexusRecomp.exe
 if errorlevel 1 (
     echo [ERROR] Build failed!
     exit /b 1
@@ -44,6 +49,7 @@ if not exist "%~dp0RecompFolder\settings.txt" (
     if exist "%~dp0settings.template.txt" (
         copy /y "%~dp0settings.template.txt" "%~dp0RecompFolder\settings.txt" >nul
         echo Created default RecompFolder\settings.txt.
+        echo [NOTE] Set GAME= in RecompFolder\settings.txt to your extracted PS3_GAME folder.
     )
 ) else (
     echo RecompFolder\settings.txt already exists, preserving user settings.

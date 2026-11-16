@@ -1,6 +1,6 @@
 # Ratchet & Clank: Into the Nexus - Settings
-# Point GAME to your dumped PS3_GAME folder
-GAME=C:\coding\Put_PS3_Game_Here\Ratchet & Clank - Into the Nexus (USA) (En,Fr,Es)\PS3_GAME
+# Point GAME to your extracted PS3_GAME folder (RecompBuilder / build_pipeline.py fill this in)
+GAME=
 
 # Display & Presentation
 RACACIT_DISPLAY_MODE=windowed

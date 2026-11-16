@@ -8,11 +8,12 @@
 // Build:
 //   clang++ -O2 -std=c++17 -static -DUNICODE -D_UNICODE -Wl,--subsystem,windows \
 //     tools/RecompBuilder.cpp -o dist/RecompBuilder.exe \
-//     -lcomctl32 -lole32 -lshell32 -luuid -lgdi32 -luser32
+//     -lcomctl32 -lole32 -lshell32 -luuid -lgdi32 -luser32 -lbcrypt
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -166,11 +167,71 @@ static std::wstring pick_file_dialog(HWND owner, const wchar_t* title) {
     return result;
 }
 
+// ---- Input verification ----------------------------------------------------
+// Only BCUS99245 v1.00 is supported: the pipeline and the game harness use
+// fixed guest addresses from that exact EBOOT. Keep in sync with build_pipeline.py.
+static const char* kExpectedTitleId   = "BCUS99245";
+static const char* kExpectedElfSha256 = "ca1a1a293d211095fc834eaaa10cd5fa9248b0e0328919fdeadeed1675c52c3f";
+
+static std::string sha256_file_hex(const fs::path& p) {
+    std::string result;
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return result;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return result;
+    if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0) {
+        std::vector<char> buf(1 << 20);
+        bool ok = true;
+        while (f) {
+            f.read(buf.data(), (std::streamsize)buf.size());
+            std::streamsize n = f.gcount();
+            if (n > 0 && BCryptHashData(h, reinterpret_cast<PUCHAR>(buf.data()), (ULONG)n, 0) != 0) { ok = false; break; }
+        }
+        unsigned char digest[32] = {};
+        if (ok && BCryptFinishHash(h, digest, sizeof(digest), 0) == 0) {
+            static const char* hex = "0123456789abcdef";
+            for (unsigned char b : digest) { result += hex[b >> 4]; result += hex[b & 15]; }
+        }
+        BCryptDestroyHash(h);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return result;
+}
+
+// Reads TITLE_ID from a PARAM.SFO. Returns empty string on any parse error.
+static std::string read_sfo_title_id(const fs::path& sfo) {
+    std::ifstream f(sfo, std::ios::binary);
+    if (!f) return {};
+    std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto u16 = [&](size_t o) -> uint32_t { return o + 2 <= d.size() ? (uint32_t)(d[o] | (d[o + 1] << 8)) : 0; };
+    auto u32 = [&](size_t o) -> uint32_t { return o + 4 <= d.size() ? (uint32_t)(d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | ((uint32_t)d[o + 3] << 24)) : 0; };
+    if (d.size() < 20 || d[0] != 0 || d[1] != 'P' || d[2] != 'S' || d[3] != 'F') return {};
+    uint32_t key_tab = u32(8), data_tab = u32(12), count = u32(16);
+    for (uint32_t i = 0; i < count && 20 + (size_t)i * 16 + 16 <= d.size(); ++i) {
+        size_t e = 20 + (size_t)i * 16;
+        size_t k = key_tab + u16(e);
+        std::string key;
+        while (k < d.size() && d[k]) key += (char)d[k++];
+        if (key != "TITLE_ID") continue;
+        size_t off = data_tab + u32(e + 12), len = u32(e + 4);
+        std::string val;
+        for (size_t j = 0; j < len && off + j < d.size() && d[off + j]; ++j) val += (char)d[off + j];
+        return val;
+    }
+    return {};
+}
+
+static bool allow_unknown_elf() {
+    wchar_t v[8] = {};
+    return GetEnvironmentVariableW(L"NEXUS_ALLOW_UNKNOWN_ELF", v, 8) > 0 && v[0] == L'1';
+}
+
+// A PS3_GAME folder must contain BOTH USRDIR\ and PARAM.SFO (extracted, not .iso/.pkg).
 static bool resolve_ps3_game_dir(const fs::path& input, fs::path& resolved) {
     auto is_valid = [](const fs::path& p) {
-        return fs::exists(p / "USRDIR" / "EBOOT.BIN") ||
-               fs::exists(p / "USRDIR" / "EBOOT.ELF") ||
-               fs::exists(p / "PARAM.SFO");
+        std::error_code ec;
+        return fs::is_directory(p / "USRDIR", ec) && fs::is_regular_file(p / "PARAM.SFO", ec);
     };
     if (is_valid(input)) { resolved = input; return true; }
     if (is_valid(input / "PS3_GAME")) { resolved = input / "PS3_GAME"; return true; }
@@ -325,10 +386,6 @@ static int run_cmd_logged(const std::wstring& cmd, const fs::path& cwd) {
     return (int)code;
 }
 
-static bool has_tool_in_path(const wchar_t* exe_name) {
-    return SearchPathW(nullptr, exe_name, nullptr, 0, nullptr, nullptr) > 0;
-}
-
 static void prepend_env_path(const fs::path& dir) {
     if (!fs::exists(dir)) return;
     DWORD len = GetEnvironmentVariableW(L"PATH", nullptr, 0);
@@ -339,79 +396,53 @@ static void prepend_env_path(const fs::path& dir) {
     SetEnvironmentVariableW(L"PATH", updated.c_str());
 }
 
-// Auto-locate existing .venv / llvm-mingw, OR download a self-contained portable toolchain
-// (Python 3.12 embeddable + pip + cmake + ninja + ziglang) into tools/.portable/
+// Pinned, hash-verified portable toolchain in tools/.portable/:
+//   Python 3.12.8 embeddable + pip 26.3 + cmake 4.4.5 + ninja 1.13.2 + ziglang 0.17.1
+// Every download is checked against a SHA-256 below, and the pip packages are
+// installed with --require-hashes from tools/toolchain-requirements.txt, so a
+// zig cc / cmake release months from now cannot silently change the build.
+// The Releases zip ships this folder pre-populated; a git clone bootstraps it.
+static const wchar_t* kPythonUrl    = L"https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip";
+static const char*    kPythonSha256 = "8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb";
+static const wchar_t* kPipWheel     = L"pip-26.3-py3-none-any.whl";
+static const wchar_t* kPipUrl       = L"https://files.pythonhosted.org/packages/py3/p/pip/pip-26.3-py3-none-any.whl";
+static const char*    kPipSha256    = "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13";
+
+static bool download_verified(const std::wstring& url, const fs::path& dst, const char* sha256, const fs::path& cwd) {
+    if (run_cmd_logged(L"curl.exe -fL --retry 3 \"" + url + L"\" -o \"" + dst.wstring() + L"\"", cwd) != 0) {
+        post_log("[ERROR] Download failed: " + wide_to_utf8(url) + " (check internet connection).");
+        return false;
+    }
+    std::string got = sha256_file_hex(dst);
+    if (got != sha256) {
+        post_log("[ERROR] SHA-256 mismatch for " + wide_to_utf8(url) + ": got " + got + ", expected " + sha256);
+        std::error_code ec;
+        fs::remove(dst, ec);
+        return false;
+    }
+    post_log("[Toolchain] Verified SHA-256 of " + dst.filename().string());
+    return true;
+}
+
 static bool ensure_toolchain(const fs::path& repo_root, fs::path& out_python) {
-    // 1. Check prebundled tools\.portable\ first, then .venv
-    fs::path pdir_pre = repo_root / "tools" / ".portable";
-    if (fs::exists(pdir_pre / "python.exe")) {
-        prepend_env_path(pdir_pre);
-        prepend_env_path(pdir_pre / "Scripts");
-        prepend_env_path(pdir_pre / "Lib" / "site-packages" / "cmake" / "data" / "bin");
-        prepend_env_path(pdir_pre / "Lib" / "site-packages" / "ziglang");
-    }
-    std::vector<fs::path> venv_candidates = {
-        repo_root / ".venv" / "Scripts",
-        repo_root.parent_path() / ".venv" / "Scripts",
-    };
-    for (const auto& d : venv_candidates) {
-        if (fs::exists(d / "python.exe")) {
-            prepend_env_path(d);
-            if (fs::exists(d.parent_path() / "Lib" / "site-packages" / "cmake" / "data" / "bin")) {
-                prepend_env_path(d.parent_path() / "Lib" / "site-packages" / "cmake" / "data" / "bin");
-            }
-            if (fs::exists(d.parent_path() / "Lib" / "site-packages" / "ziglang")) {
-                prepend_env_path(d.parent_path() / "Lib" / "site-packages" / "ziglang");
-            }
-        }
-    }
-
-    // Check WinGet llvm-mingw if installed
-    wchar_t* local_app = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local_app)) && local_app) {
-        fs::path wg = fs::path(local_app) / "Microsoft" / "WinGet" / "Packages";
-        CoTaskMemFree(local_app);
-        if (fs::exists(wg)) {
-            std::error_code ec;
-            for (const auto& e : fs::directory_iterator(wg, ec)) {
-                if (e.path().filename().string().find("LLVM-MinGW") != std::string::npos) {
-                    for (const auto& sub : fs::directory_iterator(e.path(), ec)) {
-                        if (fs::exists(sub.path() / "bin" / "clang++.exe")) {
-                            prepend_env_path(sub.path() / "bin");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (has_tool_in_path(L"python.exe") && has_tool_in_path(L"cmake.exe") &&
-        has_tool_in_path(L"ninja.exe") && (has_tool_in_path(L"clang++.exe") || has_tool_in_path(L"zig.exe"))) {
-        wchar_t py_buf[MAX_PATH] = {};
-        SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, py_buf, nullptr);
-        out_python = py_buf;
-        post_log("[Toolchain] Found ready toolchain (" + wide_to_utf8(py_buf) + ").");
-        return true;
-    }
-
-    // 2. Auto-bootstrap portable Python + CMake + Ninja + Zig into tools\.portable\ (no manual installs!)
     fs::path pdir = repo_root / "tools" / ".portable";
-    fs::create_directories(pdir);
     fs::path py_exe = pdir / "python.exe";
-    post_progress(10, "Downloading portable build tools (Python, CMake, Ninja, Zig)...");
+    fs::path reqs = repo_root / "tools" / "toolchain-requirements.txt";
+    fs::path pins_stamp = pdir / ".toolchain-pins";
+    fs::create_directories(pdir);
+
+    if (!fs::exists(reqs)) {
+        post_log("[ERROR] Missing " + reqs.string());
+        return false;
+    }
+    std::string reqs_hash = sha256_file_hex(reqs);
 
     if (!fs::exists(py_exe)) {
-        post_log("[Toolchain] Downloading Python 3.12 embeddable package...");
+        post_progress(10, "Downloading portable Python 3.12.8...");
         fs::path py_zip = pdir / "python.zip";
-        int rc = run_cmd_logged(
-            L"curl.exe -fL --retry 3 \"https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip\" -o \"" +
-            py_zip.wstring() + L"\"", pdir);
-        if (rc != 0) {
-            post_log("[ERROR] Failed to download portable Python (check internet connection).");
-            return false;
-        }
+        if (!download_verified(kPythonUrl, py_zip, kPythonSha256, pdir)) return false;
         post_log("[Toolchain] Extracting Python...");
-        rc = run_cmd_logged(L"tar.exe -xf \"" + py_zip.wstring() + L"\" -C \"" + pdir.wstring() + L"\"", pdir);
+        int rc = run_cmd_logged(L"tar.exe -xf \"" + py_zip.wstring() + L"\" -C \"" + pdir.wstring() + L"\"", pdir);
         std::error_code ec;
         fs::remove(py_zip, ec);
         if (rc != 0 || !fs::exists(py_exe)) return false;
@@ -421,6 +452,7 @@ static bool ensure_toolchain(const fs::path& repo_root, fs::path& out_python) {
         if (fs::exists(pth)) {
             std::ifstream in(pth);
             std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            in.close();
             size_t pos = content.find("#import site");
             if (pos != std::string::npos) content.replace(pos, 12, "import site");
             std::ofstream out(pth, std::ios::trunc);
@@ -429,22 +461,28 @@ static bool ensure_toolchain(const fs::path& repo_root, fs::path& out_python) {
     }
 
     if (!fs::exists(pdir / "Scripts" / "pip.exe")) {
-        post_progress(20, "Bootstrapping pip...");
-        post_log("[Toolchain] Downloading get-pip.py...");
-        fs::path gp = pdir / "get-pip.py";
-        if (run_cmd_logged(L"curl.exe -fL --retry 3 \"https://bootstrap.pypa.io/get-pip.py\" -o \"" + gp.wstring() + L"\"", pdir) != 0)
-            return false;
-        if (run_cmd_logged(L"\"" + py_exe.wstring() + L"\" \"" + gp.wstring() + L"\" --no-warn-script-location", pdir) != 0)
+        post_progress(20, "Bootstrapping pip 26.3...");
+        fs::path whl = pdir / kPipWheel;
+        if (!download_verified(kPipUrl, whl, kPipSha256, pdir)) return false;
+        // Run pip straight from its own verified wheel to install itself (no get-pip.py).
+        if (run_cmd_logged(L"\"" + py_exe.wstring() + L"\" \"" + whl.wstring() + L"\\pip\" install --no-index --no-warn-script-location \"" + whl.wstring() + L"\"", pdir) != 0)
             return false;
         std::error_code ec;
-        fs::remove(gp, ec);
+        fs::remove(whl, ec);
     }
 
-    if (!fs::exists(pdir / "Scripts" / "ninja.exe") || !fs::exists(pdir / "Lib" / "site-packages" / "cmake" / "data" / "bin" / "cmake.exe")) {
-        post_progress(30, "Installing portable CMake, Ninja & Zig C++...");
-        post_log("[Toolchain] Installing cmake, ninja, ziglang into tools\\.portable...");
-        if (run_cmd_logged(L"\"" + py_exe.wstring() + L"\" -m pip install --no-warn-script-location cmake ninja ziglang", pdir) != 0)
+    std::string have_pins;
+    if (fs::exists(pins_stamp)) { std::ifstream in(pins_stamp); std::getline(in, have_pins); }
+    if (have_pins != reqs_hash ||
+        !fs::exists(pdir / "Scripts" / "ninja.exe") ||
+        !fs::exists(pdir / "Lib" / "site-packages" / "cmake" / "data" / "bin" / "cmake.exe") ||
+        !fs::exists(pdir / "Lib" / "site-packages" / "ziglang" / "zig.exe")) {
+        post_progress(30, "Installing pinned CMake, Ninja & Zig...");
+        post_log("[Toolchain] pip install --require-hashes -r tools\\toolchain-requirements.txt");
+        if (run_cmd_logged(L"\"" + py_exe.wstring() + L"\" -m pip install --no-warn-script-location --disable-pip-version-check "
+                           L"--require-hashes --only-binary=:all: --no-deps -r \"" + reqs.wstring() + L"\"", pdir) != 0)
             return false;
+        std::ofstream(pins_stamp, std::ios::trunc) << reqs_hash << "\n";
     }
 
     prepend_env_path(pdir);
@@ -452,7 +490,7 @@ static bool ensure_toolchain(const fs::path& repo_root, fs::path& out_python) {
     prepend_env_path(pdir / "Lib" / "site-packages" / "cmake" / "data" / "bin");
     prepend_env_path(pdir / "Lib" / "site-packages" / "ziglang");
     out_python = py_exe;
-    post_log("[Toolchain] Portable toolchain ready.");
+    post_log("[Toolchain] Pinned portable toolchain ready.");
     return true;
 }
 
@@ -462,10 +500,21 @@ static void worker_build(fs::path game_input, fs::path elf_input, bool make_shor
 
     fs::path resolved_game = find_game_in_drop_dir(game_input);
     if (resolved_game.empty()) {
-        post_log("[ERROR] Invalid PS3_GAME folder: " + game_input.string());
+        post_log("[ERROR] Invalid PS3_GAME folder (needs both USRDIR\\ and PARAM.SFO): " + game_input.string());
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         CoUninitialize();
         return;
+    }
+    {
+        std::string tid = read_sfo_title_id(resolved_game / "PARAM.SFO");
+        if (tid != kExpectedTitleId) {
+            post_log("[ERROR] PARAM.SFO TITLE_ID is '" + tid + "', expected " + kExpectedTitleId +
+                     " (Ratchet & Clank: Into the Nexus, USA disc v1.00).");
+            PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+            CoUninitialize();
+            return;
+        }
+        post_log("[OK] PARAM.SFO TITLE_ID = " + tid);
     }
 
     fs::path settings_path = g_dist_dir / "settings.txt";
@@ -477,26 +526,53 @@ static void worker_build(fs::path game_input, fs::path elf_input, bool make_shor
 
     fs::path exe_path = g_dist_dir / "NexusRecomp.exe";
     if (!g_repo_root.empty()) {
-        bool need_lift = !fs::exists(g_repo_root / "game" / "src" / "recomp" / "ppu_recomp.h");
         fs::path target_elf = g_repo_root / "elf" / "EBOOT.ELF";
 
-        if (need_lift && !is_valid_elf(target_elf)) {
-            fs::path src_elf = fs::is_directory(elf_input) ? find_elf_in_drop_dir(elf_input) : elf_input;
-            if (src_elf.empty()) src_elf = find_elf_in_drop_dir(g_repo_root / "Put_ELF_Here");
-            if (src_elf.empty() && is_valid_elf(resolved_game / "USRDIR" / "EBOOT.elf"))
-                src_elf = resolved_game / "USRDIR" / "EBOOT.elf";
-            if (src_elf.empty() && is_valid_elf(resolved_game / "USRDIR" / "EBOOT.ELF"))
-                src_elf = resolved_game / "USRDIR" / "EBOOT.ELF";
+        // Pick the ELF the user selected (or dropped), falling back to an already staged one.
+        fs::path src_elf = fs::is_directory(elf_input) ? find_elf_in_drop_dir(elf_input) : elf_input;
+        if (src_elf.empty() || !is_valid_elf(src_elf)) src_elf = find_elf_in_drop_dir(g_repo_root / "Put_ELF_Here");
+        if (src_elf.empty() && is_valid_elf(resolved_game / "USRDIR" / "EBOOT.elf"))
+            src_elf = resolved_game / "USRDIR" / "EBOOT.elf";
+        if (src_elf.empty() && is_valid_elf(target_elf))
+            src_elf = target_elf;
 
-            if (src_elf.empty() || !is_valid_elf(src_elf)) {
-                post_log("[ERROR] Valid decrypted EBOOT.ELF not found. Use RPCS3: Utilities -> Decrypt PS3 Binaries on EBOOT.BIN.");
+        if (src_elf.empty() || !is_valid_elf(src_elf)) {
+            post_log("[ERROR] Valid decrypted EBOOT.ELF not found. Use RPCS3: Utilities -> Decrypt PS3 Binaries on EBOOT.BIN.");
+            PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+            CoUninitialize();
+            return;
+        }
+        post_progress(5, "Verifying EBOOT.ELF (SHA-256)...");
+        std::string elf_sha = sha256_file_hex(src_elf);
+        if (elf_sha != kExpectedElfSha256) {
+            if (!allow_unknown_elf()) {
+                post_log("[ERROR] EBOOT.ELF SHA-256 is " + elf_sha);
+                post_log("        expected " + std::string(kExpectedElfSha256));
+                post_log("        Only the RPCS3-decrypted EBOOT.BIN of BCUS99245 v1.00 (disc, no update) is supported.");
                 PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
                 CoUninitialize();
                 return;
             }
+            post_log("[WARN] Unknown EBOOT.ELF SHA-256 (NEXUS_ALLOW_UNKNOWN_ELF=1, unsupported): " + elf_sha);
+        } else {
+            post_log("[OK] EBOOT.ELF SHA-256 matches BCUS99245 v1.00");
+        }
+        std::error_code ec_eq;
+        if (!fs::equivalent(src_elf, target_elf, ec_eq) &&
+            (!fs::exists(target_elf) || sha256_file_hex(target_elf) != elf_sha)) {
             fs::create_directories(target_elf.parent_path());
             fs::copy_file(src_elf, target_elf, fs::copy_options::overwrite_existing);
             post_log("[OK] Staged EBOOT.ELF -> " + target_elf.string());
+        }
+
+        // Re-lift unless the existing lift was produced from this exact ELF
+        // (build_pipeline.py writes out/lift_stamp.txt and also re-checks the recipe).
+        bool need_lift = !fs::exists(g_repo_root / "game" / "src" / "recomp" / "ppu_recomp.h");
+        {
+            std::ifstream st(g_repo_root / "out" / "lift_stamp.txt");
+            std::string first;
+            std::getline(st, first);
+            if (first != "elf_sha256=" + elf_sha) need_lift = true;
         }
 
         fs::path py_exe;

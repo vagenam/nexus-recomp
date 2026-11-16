@@ -1,29 +1,54 @@
-Project Raccoon v0.3 — Third-Party Notices
-==========================================
+Project Raccoon — Third-Party Notices
+=====================================
 
-This release bundles or relies on the following open-source tools and libraries.
-No copyrighted game binaries, assets, or Sony/Insomniac code are included.
+This project bundles, builds with, or statically links the following open-source
+third-party libraries and tools. No copyrighted game binaries, Sony proprietary
+firmware modules, or Insomniac assets are included.
 
 1. Python (3.12 Embeddable)
    License: Python Software Foundation License (PSF-2.0)
-   https://www.python.org/
+   Website: https://www.python.org/
 
 2. CMake
    License: BSD-3-Clause License
-   https://cmake.org/
+   Website: https://cmake.org/
 
 3. Ninja
    License: Apache License 2.0
-   https://ninja-build.org/
+   Website: https://ninja-build.org/
 
 4. Zig (ziglang)
    License: MIT License
-   https://ziglang.org/
+   Website: https://ziglang.org/
 
-5. SDL2
+5. SDL2 (Simple DirectMedia Layer 2)
    License: zlib License
-   https://www.libsdl.org/
+   Website: https://www.libsdl.org/
 
 6. ps3recomp
-   PS3 PPU/SPU/RSX static recompilation runtime & tooling
-   https://github.com/sp00nznet/ps3recomp
+   Static recompilation runtime and tooling for PS3 PPU / SPU / RSX
+   License: MIT License (Copyright (c) 2026 Ned Heller / sp00nznet)
+   Website: https://github.com/sp00nznet/ps3recomp
+
+7. Vulkan-Headers
+   Vulkan header files and API registry
+   License: Apache License 2.0 / MIT License (Khronos Group)
+   Website: https://github.com/KhronosGroup/Vulkan-Headers
+
+8. glslang
+   Khronos reference GLSL/HLSL compiler front-end and SPIR-V generator
+   License: 3-Clause BSD, MIT, and Apache 2.0 licenses (Khronos Group)
+   Website: https://github.com/KhronosGroup/glslang
+
+9. zlib
+   General-purpose lossless data-compression library
+   License: zlib License (Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler)
+   Website: https://www.zlib.net/
+
+10. at3_standalone / FFmpeg ATRAC3plus decoder
+    Extracted from PPSSPP / FFmpeg for cellAtrac audio playback.
+    License: GNU Lesser General Public License version 2.1 (LGPL-2.1)
+    Location: tools/ps3recomp/third_party/at3_standalone/
+    Note: Statically linked into the ps3recomp runtime library (via
+    tools/ps3recomp/CMakeLists.txt). Source code is included in full in
+    tools/ps3recomp/third_party/at3_standalone/.
